@@ -1,0 +1,15 @@
+zen gets out of your way and
+makes it easy to get stuff done
+-------------------------------
+
+zen is
+  a coding agent manager
+  a powerful efficient TUI
+  ~20 files of safe Rust
+
+zen isnt
+  bloatware or spyware
+  going to slow you down  
+  overselling itself
+
+curl -fsSL https://github.com/TheHiddenLayer/zen/releases/latest/download/zen-$(uname -m | sed 's/arm64/aarch64/')-$(case "$(uname -s)" in Linux) echo "unknown-linux-gnu";; Darwin) echo "apple-darwin";; esac).tar.gz | tar -xz && sudo mv zen /usr/local/bin/
