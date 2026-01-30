@@ -5,4 +5,4 @@
 
 mod types;
 
-pub use types::{WorkflowId, WorkflowPhase, WorkflowStatus};
+pub use types::{TaskId, Workflow, WorkflowConfig, WorkflowId, WorkflowPhase, WorkflowStatus};

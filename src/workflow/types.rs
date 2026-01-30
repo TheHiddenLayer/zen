@@ -1,5 +1,6 @@
 //! Core workflow type definitions.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -108,6 +109,145 @@ impl std::fmt::Display for WorkflowStatus {
             WorkflowStatus::Completed => write!(f, "completed"),
             WorkflowStatus::Failed => write!(f, "failed"),
         }
+    }
+}
+
+/// Unique identifier for a task within a workflow.
+///
+/// This is a placeholder type that will be fully implemented in Step 8.
+/// For now it provides the basic structure needed by the Workflow type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TaskId(pub Uuid);
+
+impl TaskId {
+    /// Create a new unique task identifier.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for TaskId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Configuration options for a workflow execution.
+///
+/// Controls behavior like documentation updates and parallelism limits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowConfig {
+    /// Whether to run /codebase-summary phase for documentation updates.
+    pub update_docs: bool,
+    /// Maximum number of concurrent agents during implementation phase.
+    pub max_parallel_agents: usize,
+    /// Prefix for staging branches (e.g., "zen/staging/").
+    pub staging_branch_prefix: String,
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            update_docs: true,
+            max_parallel_agents: 4,
+            staging_branch_prefix: String::from("zen/staging/"),
+        }
+    }
+}
+
+/// A workflow representing a complete orchestration run.
+///
+/// Each workflow tracks the original user prompt, current execution phase,
+/// status, timestamps, configuration, and associated task IDs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workflow {
+    /// Unique identifier for this workflow.
+    pub id: WorkflowId,
+    /// Human-readable name derived from the prompt.
+    pub name: String,
+    /// Original user prompt that initiated this workflow.
+    pub prompt: String,
+    /// Current execution phase.
+    pub phase: WorkflowPhase,
+    /// Current workflow status.
+    pub status: WorkflowStatus,
+    /// Configuration options for this workflow.
+    pub config: WorkflowConfig,
+    /// When the workflow was created.
+    pub created_at: DateTime<Utc>,
+    /// When the workflow started executing.
+    pub started_at: Option<DateTime<Utc>>,
+    /// When the workflow completed (success or failure).
+    pub completed_at: Option<DateTime<Utc>>,
+    /// IDs of tasks associated with this workflow.
+    #[serde(rename = "tasks")]
+    pub task_ids: Vec<TaskId>,
+}
+
+impl Workflow {
+    /// Create a new workflow from a user prompt.
+    ///
+    /// The workflow starts in the Pending status with the Planning phase.
+    /// A name is automatically derived from the first few words of the prompt.
+    pub fn new(prompt: &str, config: WorkflowConfig) -> Self {
+        Self {
+            id: WorkflowId::new(),
+            name: Self::derive_name(prompt),
+            prompt: prompt.to_string(),
+            phase: WorkflowPhase::Planning,
+            status: WorkflowStatus::Pending,
+            config,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            task_ids: Vec::new(),
+        }
+    }
+
+    /// Derive a kebab-case name from the prompt.
+    ///
+    /// Takes the first few words, lowercases them, and joins with hyphens.
+    fn derive_name(prompt: &str) -> String {
+        prompt
+            .split_whitespace()
+            .take(4)
+            .map(|w| w.to_lowercase())
+            .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+
+    /// Start the workflow execution.
+    ///
+    /// Sets status to Running and records the start time.
+    pub fn start(&mut self) {
+        self.status = WorkflowStatus::Running;
+        self.started_at = Some(Utc::now());
+    }
+
+    /// Mark the workflow as successfully completed.
+    ///
+    /// Sets status to Completed, phase to Complete, and records completion time.
+    pub fn complete(&mut self) {
+        self.status = WorkflowStatus::Completed;
+        self.phase = WorkflowPhase::Complete;
+        self.completed_at = Some(Utc::now());
+    }
+
+    /// Mark the workflow as failed.
+    ///
+    /// Sets status to Failed and records completion time.
+    pub fn fail(&mut self) {
+        self.status = WorkflowStatus::Failed;
+        self.completed_at = Some(Utc::now());
     }
 }
 
@@ -319,5 +459,185 @@ mod tests {
         assert_eq!(serde_json::to_string(&WorkflowStatus::Paused).unwrap(), r#""paused""#);
         assert_eq!(serde_json::to_string(&WorkflowStatus::Completed).unwrap(), r#""completed""#);
         assert_eq!(serde_json::to_string(&WorkflowStatus::Failed).unwrap(), r#""failed""#);
+    }
+
+    // TaskId tests
+
+    #[test]
+    fn test_task_id_new() {
+        let id1 = TaskId::new();
+        let id2 = TaskId::new();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_task_id_default() {
+        let id = TaskId::default();
+        assert!(!id.0.is_nil());
+    }
+
+    #[test]
+    fn test_task_id_display() {
+        let id = TaskId::new();
+        let display = format!("{}", id);
+        assert_eq!(display, id.0.to_string());
+    }
+
+    #[test]
+    fn test_task_id_serialization() {
+        let id = TaskId::new();
+        let json = serde_json::to_string(&id).unwrap();
+        let parsed: TaskId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, parsed);
+    }
+
+    // WorkflowConfig tests
+
+    #[test]
+    fn test_workflow_config_default() {
+        let config = WorkflowConfig::default();
+        assert!(config.update_docs);
+        assert_eq!(config.max_parallel_agents, 4);
+        assert_eq!(config.staging_branch_prefix, "zen/staging/");
+    }
+
+    #[test]
+    fn test_workflow_config_custom_values() {
+        let config = WorkflowConfig {
+            update_docs: false,
+            max_parallel_agents: 8,
+            staging_branch_prefix: String::from("custom/staging/"),
+        };
+        assert!(!config.update_docs);
+        assert_eq!(config.max_parallel_agents, 8);
+        assert_eq!(config.staging_branch_prefix, "custom/staging/");
+    }
+
+    #[test]
+    fn test_workflow_config_serialization() {
+        let config = WorkflowConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: WorkflowConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.update_docs, parsed.update_docs);
+        assert_eq!(config.max_parallel_agents, parsed.max_parallel_agents);
+        assert_eq!(config.staging_branch_prefix, parsed.staging_branch_prefix);
+    }
+
+    // Workflow tests
+
+    #[test]
+    fn test_workflow_new() {
+        let config = WorkflowConfig::default();
+        let workflow = Workflow::new("build user authentication", config);
+
+        assert!(!workflow.id.0.is_nil());
+        assert_eq!(workflow.prompt, "build user authentication");
+        assert_eq!(workflow.status, WorkflowStatus::Pending);
+        assert_eq!(workflow.phase, WorkflowPhase::Planning);
+        assert!(workflow.started_at.is_none());
+        assert!(workflow.completed_at.is_none());
+        assert!(workflow.task_ids.is_empty());
+    }
+
+    #[test]
+    fn test_workflow_name_derivation() {
+        let config = WorkflowConfig::default();
+        let workflow = Workflow::new("build user authentication", config);
+        assert_eq!(workflow.name, "build-user-authentication");
+    }
+
+    #[test]
+    fn test_workflow_name_derivation_long_prompt() {
+        let config = WorkflowConfig::default();
+        let workflow = Workflow::new("create a complete user management system with roles", config);
+        // Only takes first 4 words
+        assert_eq!(workflow.name, "create-a-complete-user");
+    }
+
+    #[test]
+    fn test_workflow_name_derivation_special_chars() {
+        let config = WorkflowConfig::default();
+        let workflow = Workflow::new("Build the API!", config);
+        assert_eq!(workflow.name, "build-the-api");
+    }
+
+    #[test]
+    fn test_workflow_start() {
+        let config = WorkflowConfig::default();
+        let mut workflow = Workflow::new("test prompt", config);
+
+        assert_eq!(workflow.status, WorkflowStatus::Pending);
+        assert!(workflow.started_at.is_none());
+
+        workflow.start();
+
+        assert_eq!(workflow.status, WorkflowStatus::Running);
+        assert!(workflow.started_at.is_some());
+    }
+
+    #[test]
+    fn test_workflow_complete() {
+        let config = WorkflowConfig::default();
+        let mut workflow = Workflow::new("test prompt", config);
+        workflow.start();
+
+        workflow.complete();
+
+        assert_eq!(workflow.status, WorkflowStatus::Completed);
+        assert_eq!(workflow.phase, WorkflowPhase::Complete);
+        assert!(workflow.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_workflow_fail() {
+        let config = WorkflowConfig::default();
+        let mut workflow = Workflow::new("test prompt", config);
+        workflow.start();
+
+        workflow.fail();
+
+        assert_eq!(workflow.status, WorkflowStatus::Failed);
+        assert!(workflow.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_workflow_with_custom_config() {
+        let config = WorkflowConfig {
+            update_docs: false,
+            max_parallel_agents: 2,
+            staging_branch_prefix: String::from("test/staging/"),
+        };
+        let workflow = Workflow::new("test prompt", config);
+
+        assert!(!workflow.config.update_docs);
+        assert_eq!(workflow.config.max_parallel_agents, 2);
+        assert_eq!(workflow.config.staging_branch_prefix, "test/staging/");
+    }
+
+    #[test]
+    fn test_workflow_serialization() {
+        let config = WorkflowConfig::default();
+        let workflow = Workflow::new("build user authentication", config);
+
+        let json = serde_json::to_string(&workflow).unwrap();
+        let parsed: Workflow = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(workflow.id, parsed.id);
+        assert_eq!(workflow.name, parsed.name);
+        assert_eq!(workflow.prompt, parsed.prompt);
+        assert_eq!(workflow.status, parsed.status);
+        assert_eq!(workflow.phase, parsed.phase);
+    }
+
+    #[test]
+    fn test_workflow_serialization_has_tasks_field() {
+        let config = WorkflowConfig::default();
+        let workflow = Workflow::new("test", config);
+
+        let json = serde_json::to_string(&workflow).unwrap();
+
+        // Verify the field is named "tasks" not "task_ids" in JSON
+        assert!(json.contains(r#""tasks":"#));
+        assert!(!json.contains(r#""task_ids":"#));
     }
 }
