@@ -5,6 +5,7 @@ pub mod git;
 pub mod git_notes;
 pub mod git_refs;
 pub mod log;
+pub mod orchestration;
 pub mod session;
 pub mod state;
 pub mod tmux;
