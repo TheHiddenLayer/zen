@@ -1,108 +1,153 @@
+//! Git notes management under the `refs/notes/zen/` namespace.
+//!
+//! This module provides primitives for attaching JSON-serialized data
+//! to commits as git notes, which will be used by the GitStateManager.
+
 use std::path::{Path, PathBuf};
 
-use git2::{Oid, Repository, Signature};
+use git2::{ErrorCode, Oid, Repository, Signature};
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::Result;
+use crate::{zlog_debug, Result};
 
-/// The notes reference used for zen state storage.
-const NOTES_REF: &str = "refs/notes/zen";
+/// The namespace prefix for all zen notes refs.
+const ZEN_NOTES_PREFIX: &str = "refs/notes/zen/";
 
-/// Git notes operations for storing JSON data attached to commits.
-///
-/// This module provides a way to store arbitrary JSON data as git notes
-/// under the `refs/notes/zen` namespace, keeping state in git itself
-/// rather than external JSON files.
+/// Manages git notes under the `refs/notes/zen/` namespace.
 pub struct GitNotes {
     repo_path: PathBuf,
 }
 
 impl GitNotes {
     /// Create a new GitNotes instance for the given repository path.
+    ///
+    /// # Errors
+    /// Returns an error if the path is not a valid git repository.
     pub fn new(repo_path: &Path) -> Result<Self> {
+        zlog_debug!("GitNotes::new path={}", repo_path.display());
         let _ = Repository::discover(repo_path)?;
         Ok(Self {
             repo_path: repo_path.to_path_buf(),
         })
     }
 
+    /// Get a fresh Repository handle.
     fn repo(&self) -> Result<Repository> {
         Ok(Repository::discover(&self.repo_path)?)
     }
 
-    fn signature(&self) -> Result<Signature<'static>> {
-        let repo = self.repo()?;
-        Ok(repo
-            .signature()
-            .or_else(|_| Signature::now("Zen", "zen@localhost"))?)
+    /// Build the full notes ref name from the namespace.
+    fn notes_ref(namespace: &str) -> String {
+        format!("{}{}", ZEN_NOTES_PREFIX, namespace)
     }
 
-    /// Add a JSON note to a commit under refs/notes/zen/.
-    ///
-    /// If a note already exists for this commit, it will be overwritten.
-    pub fn add<T: Serialize>(&self, commit_oid: &str, data: &T) -> Result<()> {
-        let repo = self.repo()?;
-        let oid = Oid::from_str(commit_oid)?;
-        let json = serde_json::to_string_pretty(data)?;
-        let sig = self.signature()?;
+    /// Get a default signature for note operations.
+    fn signature() -> Result<Signature<'static>> {
+        Ok(Signature::now("zen", "zen@localhost")?)
+    }
 
-        repo.note(&sig, &sig, Some(NOTES_REF), oid, &json, true)?;
+    /// Check if a note exists for the commit in the given namespace.
+    pub fn note_exists(&self, commit: &str, namespace: &str) -> Result<bool> {
+        let repo = self.repo()?;
+        let notes_ref = Self::notes_ref(namespace);
+        let oid = Oid::from_str(commit)?;
+
+        let result = match repo.find_note(Some(&notes_ref), oid) {
+            Ok(_) => Ok(true),
+            Err(e) if e.code() == ErrorCode::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        };
+        result
+    }
+
+    /// Attach JSON-serialized data as a note to a commit.
+    ///
+    /// Notes are stored under `refs/notes/zen/{namespace}`.
+    /// Overwrites existing note if present.
+    pub fn set_note<T: Serialize>(&self, commit: &str, namespace: &str, data: &T) -> Result<()> {
+        zlog_debug!("GitNotes::set_note commit={} namespace={}", commit, namespace);
+        let repo = self.repo()?;
+        let notes_ref = Self::notes_ref(namespace);
+        let oid = Oid::from_str(commit)?;
+        let sig = Self::signature()?;
+
+        let json = serde_json::to_string(data)?;
+        repo.note(&sig, &sig, Some(&notes_ref), oid, &json, true)?;
+
+        zlog_debug!("Set note on {} in {}", commit, notes_ref);
         Ok(())
     }
 
-    /// Read a JSON note from a commit.
+    /// Read and deserialize a JSON note from a commit.
     ///
-    /// Returns `Ok(None)` if no note exists for this commit.
-    pub fn read<T: DeserializeOwned>(&self, commit_oid: &str) -> Result<Option<T>> {
+    /// Returns `None` if no note exists.
+    pub fn get_note<T: DeserializeOwned>(&self, commit: &str, namespace: &str) -> Result<Option<T>> {
         let repo = self.repo()?;
-        let oid = Oid::from_str(commit_oid)?;
+        let notes_ref = Self::notes_ref(namespace);
+        let oid = Oid::from_str(commit)?;
 
-        let message = match repo.find_note(Some(NOTES_REF), oid) {
-            Ok(note) => note.message().unwrap_or("").to_string(),
-            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
+        let result = match repo.find_note(Some(&notes_ref), oid) {
+            Ok(note) => {
+                let message = note.message().unwrap_or("");
+                zlog_debug!("Read note from {} in {}: {}", commit, notes_ref, message);
+                let data: T = serde_json::from_str(message)?;
+                Ok(Some(data))
+            }
+            Err(e) if e.code() == ErrorCode::NotFound => {
+                zlog_debug!("No note found for {} in {}", commit, notes_ref);
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
         };
-
-        let data: T = serde_json::from_str(&message)?;
-        Ok(Some(data))
+        result
     }
 
-    /// Remove a note from a commit.
+    /// Remove a note from a commit under the specified namespace.
     ///
-    /// Succeeds without error if no note exists for this commit.
-    pub fn remove(&self, commit_oid: &str) -> Result<()> {
+    /// This is idempotent - no error if note doesn't exist.
+    pub fn delete_note(&self, commit: &str, namespace: &str) -> Result<()> {
+        zlog_debug!("GitNotes::delete_note commit={} namespace={}", commit, namespace);
         let repo = self.repo()?;
-        let oid = Oid::from_str(commit_oid)?;
-        let sig = self.signature()?;
+        let notes_ref = Self::notes_ref(namespace);
+        let oid = Oid::from_str(commit)?;
+        let sig = Self::signature()?;
 
-        match repo.note_delete(oid, Some(NOTES_REF), &sig, &sig) {
-            Ok(_) => Ok(()),
-            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(()),
+        match repo.note_delete(oid, Some(&notes_ref), &sig, &sig) {
+            Ok(_) => {
+                zlog_debug!("Deleted note from {} in {}", commit, notes_ref);
+                Ok(())
+            }
+            Err(e) if e.code() == ErrorCode::NotFound => {
+                zlog_debug!("No note to delete for {} in {}", commit, notes_ref);
+                Ok(())
+            }
             Err(e) => Err(e.into()),
         }
     }
 
-    /// List all commit OIDs that have notes in refs/notes/zen/.
-    pub fn list(&self) -> Result<Vec<String>> {
+    /// List all commit SHAs that have notes in the namespace.
+    pub fn list_notes(&self, namespace: &str) -> Result<Vec<String>> {
         let repo = self.repo()?;
-        let mut oids = Vec::new();
+        let notes_ref = Self::notes_ref(namespace);
+        let mut commits = Vec::new();
 
-        // notes_foreach requires a callback and iterates through all notes
-        match repo.notes(Some(NOTES_REF)) {
-            Ok(notes) => {
-                for note_result in notes {
+        // Try to find the notes ref - if it doesn't exist, return empty list
+        match repo.find_reference(&notes_ref) {
+            Ok(_) => {
+                repo.notes(Some(&notes_ref))?.for_each(|note_result| {
                     if let Ok((_, annotated_oid)) = note_result {
-                        oids.push(annotated_oid.to_string());
+                        commits.push(annotated_oid.to_string());
                     }
-                }
+                });
             }
-            Err(e) if e.code() == git2::ErrorCode::NotFound => {
-                // No notes ref exists yet, return empty list
+            Err(e) if e.code() == ErrorCode::NotFound => {
+                // No notes ref yet, return empty list
             }
             Err(e) => return Err(e.into()),
         }
 
-        Ok(oids)
+        zlog_debug!("Listed {} notes in {}", commits.len(), notes_ref);
+        Ok(commits)
     }
 }
 
@@ -110,263 +155,217 @@ impl GitNotes {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
-    use std::fs;
+    use tempfile::TempDir;
 
-    /// Helper to create a temporary git repository with an initial commit.
-    fn setup_test_repo() -> (tempfile::TempDir, String) {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(temp_dir.path()).unwrap();
+    #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+    struct TestData {
+        name: String,
+        count: u32,
+    }
+
+    /// Create a temporary git repository with an initial commit.
+    fn setup_test_repo() -> (TempDir, String) {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let repo = Repository::init(temp_dir.path()).expect("Failed to init repo");
 
         // Create an initial commit
-        let sig = Signature::now("Test", "test@test.com").unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
         let tree_id = repo.index().unwrap().write_tree().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
-        let commit_oid = repo
+        let commit_id = repo
             .commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
             .unwrap();
 
-        (temp_dir, commit_oid.to_string())
+        (temp_dir, commit_id.to_string())
     }
 
-    /// Helper to create additional commits for testing.
-    fn create_commit(repo_path: &Path, message: &str) -> String {
+    /// Create a second commit for testing multiple commits.
+    fn create_second_commit(repo_path: &Path) -> String {
         let repo = Repository::open(repo_path).unwrap();
-        let sig = Signature::now("Test", "test@test.com").unwrap();
-
-        // Create a file to have something to commit
-        let file_path = repo_path.join(format!("{}.txt", message.replace(' ', "_")));
-        fs::write(&file_path, message).unwrap();
-
-        let mut index = repo.index().unwrap();
-        index
-            .add_path(Path::new(file_path.file_name().unwrap()))
-            .unwrap();
-        index.write().unwrap();
-        let tree_id = index.write_tree().unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
-
-        let head = repo.head().unwrap().peel_to_commit().unwrap();
-        let commit_oid = repo
-            .commit(Some("HEAD"), &sig, &sig, message, &tree, &[&head])
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let commit_id = repo
+            .commit(Some("HEAD"), &sig, &sig, "Second commit", &tree, &[&parent])
             .unwrap();
-
-        commit_oid.to_string()
+        commit_id.to_string()
     }
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
-    struct TestData {
-        name: String,
-        value: i32,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
-    struct ComplexData {
-        id: String,
-        items: Vec<String>,
-        nested: NestedData,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
-    struct NestedData {
-        flag: bool,
-        count: u64,
-    }
-
-    // T1: Add a JSON note to a commit - verify it can be read back
     #[test]
-    fn test_add_and_read_note() {
-        let (temp_dir, commit_oid) = setup_test_repo();
+    fn test_new_with_valid_repo() {
+        let (temp_dir, _) = setup_test_repo();
+        let result = GitNotes::new(temp_dir.path());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_new_with_invalid_path() {
+        let result = GitNotes::new(Path::new("/nonexistent/path"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_and_get_note() {
+        let (temp_dir, commit_sha) = setup_test_repo();
         let notes = GitNotes::new(temp_dir.path()).unwrap();
 
         let data = TestData {
             name: "test".to_string(),
-            value: 42,
+            count: 42,
         };
 
-        notes.add(&commit_oid, &data).unwrap();
-        let read_data: Option<TestData> = notes.read(&commit_oid).unwrap();
+        // Set note
+        notes.set_note(&commit_sha, "workflow", &data).unwrap();
 
-        assert_eq!(read_data, Some(data));
+        // Get it back
+        let retrieved: Option<TestData> = notes.get_note(&commit_sha, "workflow").unwrap();
+        assert_eq!(retrieved, Some(data));
     }
 
-    // T2: Read a note from a commit that has no note - returns None
     #[test]
-    fn test_read_nonexistent_note() {
-        let (temp_dir, commit_oid) = setup_test_repo();
+    fn test_get_note_nonexistent() {
+        let (temp_dir, commit_sha) = setup_test_repo();
         let notes = GitNotes::new(temp_dir.path()).unwrap();
 
-        let read_data: Option<TestData> = notes.read(&commit_oid).unwrap();
-
-        assert_eq!(read_data, None);
+        let retrieved: Option<TestData> = notes.get_note(&commit_sha, "workflow").unwrap();
+        assert_eq!(retrieved, None);
     }
 
-    // T3: Remove a note from a commit - verify it's gone
     #[test]
-    fn test_remove_note() {
-        let (temp_dir, commit_oid) = setup_test_repo();
-        let notes = GitNotes::new(temp_dir.path()).unwrap();
-
-        let data = TestData {
-            name: "to_delete".to_string(),
-            value: 99,
-        };
-        notes.add(&commit_oid, &data).unwrap();
-
-        // Verify note exists
-        let read_data: Option<TestData> = notes.read(&commit_oid).unwrap();
-        assert!(read_data.is_some());
-
-        // Remove and verify gone
-        notes.remove(&commit_oid).unwrap();
-        let read_data: Option<TestData> = notes.read(&commit_oid).unwrap();
-        assert_eq!(read_data, None);
-    }
-
-    // T4: Remove a note from a commit that has no note - succeeds without error
-    #[test]
-    fn test_remove_nonexistent_note() {
-        let (temp_dir, commit_oid) = setup_test_repo();
-        let notes = GitNotes::new(temp_dir.path()).unwrap();
-
-        // Should not error
-        let result = notes.remove(&commit_oid);
-        assert!(result.is_ok());
-    }
-
-    // T5: Add a complex struct as JSON note - verify round-trip serialization
-    #[test]
-    fn test_complex_struct_roundtrip() {
-        let (temp_dir, commit_oid) = setup_test_repo();
-        let notes = GitNotes::new(temp_dir.path()).unwrap();
-
-        let data = ComplexData {
-            id: "abc-123".to_string(),
-            items: vec!["one".to_string(), "two".to_string(), "three".to_string()],
-            nested: NestedData {
-                flag: true,
-                count: 9999,
-            },
-        };
-
-        notes.add(&commit_oid, &data).unwrap();
-        let read_data: Option<ComplexData> = notes.read(&commit_oid).unwrap();
-
-        assert_eq!(read_data, Some(data));
-    }
-
-    // T6: Overwrite an existing note
-    #[test]
-    fn test_overwrite_note() {
-        let (temp_dir, commit_oid) = setup_test_repo();
+    fn test_set_note_overwrites() {
+        let (temp_dir, commit_sha) = setup_test_repo();
         let notes = GitNotes::new(temp_dir.path()).unwrap();
 
         let data1 = TestData {
             name: "first".to_string(),
-            value: 1,
+            count: 1,
         };
         let data2 = TestData {
             name: "second".to_string(),
-            value: 2,
+            count: 2,
         };
 
-        notes.add(&commit_oid, &data1).unwrap();
-        notes.add(&commit_oid, &data2).unwrap();
+        // Set first note
+        notes.set_note(&commit_sha, "workflow", &data1).unwrap();
 
-        let read_data: Option<TestData> = notes.read(&commit_oid).unwrap();
-        assert_eq!(read_data, Some(data2));
+        // Overwrite with second note
+        notes.set_note(&commit_sha, "workflow", &data2).unwrap();
+
+        // Should get the second one
+        let retrieved: Option<TestData> = notes.get_note(&commit_sha, "workflow").unwrap();
+        assert_eq!(retrieved, Some(data2));
     }
 
-    // T7: List notes when none exist - returns empty vec
     #[test]
-    fn test_list_empty() {
-        let (temp_dir, _commit_oid) = setup_test_repo();
+    fn test_delete_note() {
+        let (temp_dir, commit_sha) = setup_test_repo();
         let notes = GitNotes::new(temp_dir.path()).unwrap();
 
-        let list = notes.list().unwrap();
+        let data = TestData {
+            name: "test".to_string(),
+            count: 42,
+        };
+
+        // Set note
+        notes.set_note(&commit_sha, "workflow", &data).unwrap();
+        assert!(notes.note_exists(&commit_sha, "workflow").unwrap());
+
+        // Delete it
+        notes.delete_note(&commit_sha, "workflow").unwrap();
+        assert!(!notes.note_exists(&commit_sha, "workflow").unwrap());
+
+        // Verify it's gone
+        let retrieved: Option<TestData> = notes.get_note(&commit_sha, "workflow").unwrap();
+        assert_eq!(retrieved, None);
+    }
+
+    #[test]
+    fn test_delete_nonexistent_note_succeeds() {
+        let (temp_dir, commit_sha) = setup_test_repo();
+        let notes = GitNotes::new(temp_dir.path()).unwrap();
+
+        // Should not error
+        let result = notes.delete_note(&commit_sha, "workflow");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_list_notes_empty() {
+        let (temp_dir, _) = setup_test_repo();
+        let notes = GitNotes::new(temp_dir.path()).unwrap();
+
+        let list = notes.list_notes("workflow").unwrap();
         assert!(list.is_empty());
     }
 
-    // T8: List notes after adding several - returns all commit OIDs
     #[test]
-    fn test_list_multiple_notes() {
-        let (temp_dir, commit_oid1) = setup_test_repo();
-        let commit_oid2 = create_commit(temp_dir.path(), "second commit");
-        let commit_oid3 = create_commit(temp_dir.path(), "third commit");
-
+    fn test_list_notes() {
+        let (temp_dir, commit1) = setup_test_repo();
+        let commit2 = create_second_commit(temp_dir.path());
         let notes = GitNotes::new(temp_dir.path()).unwrap();
 
-        // Add notes to commits 1 and 3 (not 2)
-        notes
-            .add(
-                &commit_oid1,
-                &TestData {
-                    name: "one".to_string(),
-                    value: 1,
-                },
-            )
-            .unwrap();
-        notes
-            .add(
-                &commit_oid3,
-                &TestData {
-                    name: "three".to_string(),
-                    value: 3,
-                },
-            )
-            .unwrap();
-
-        let list = notes.list().unwrap();
-        assert_eq!(list.len(), 2);
-        assert!(list.contains(&commit_oid1));
-        assert!(list.contains(&commit_oid3));
-        assert!(!list.contains(&commit_oid2));
-    }
-
-    // T9: Operations with invalid commit OID - returns appropriate error
-    #[test]
-    fn test_invalid_oid() {
-        let (temp_dir, _commit_oid) = setup_test_repo();
-        let notes = GitNotes::new(temp_dir.path()).unwrap();
-
-        let result = notes.add(
-            "not-a-valid-oid",
-            &TestData {
-                name: "test".to_string(),
-                value: 0,
-            },
-        );
-        assert!(result.is_err());
-
-        let result: Result<Option<TestData>> = notes.read("not-a-valid-oid");
-        assert!(result.is_err());
-    }
-
-    // T10: Note namespace isolation - notes under refs/notes/zen/ don't affect refs/notes/commits
-    #[test]
-    fn test_namespace_isolation() {
-        let (temp_dir, commit_oid) = setup_test_repo();
-        let repo = Repository::open(temp_dir.path()).unwrap();
-        let notes = GitNotes::new(temp_dir.path()).unwrap();
-
-        // Add a note via GitNotes (uses refs/notes/zen)
-        let zen_data = TestData {
-            name: "zen".to_string(),
-            value: 100,
+        let data = TestData {
+            name: "test".to_string(),
+            count: 42,
         };
-        notes.add(&commit_oid, &zen_data).unwrap();
 
-        // Add a note directly to default namespace (refs/notes/commits)
-        let sig = Signature::now("Test", "test@test.com").unwrap();
-        let oid = Oid::from_str(&commit_oid).unwrap();
-        repo.note(&sig, &sig, None, oid, "default note content", false)
-            .unwrap();
+        // Add notes to both commits
+        notes.set_note(&commit1, "workflow", &data).unwrap();
+        notes.set_note(&commit2, "workflow", &data).unwrap();
 
-        // Verify zen note is independent
-        let read_zen: Option<TestData> = notes.read(&commit_oid).unwrap();
-        assert_eq!(read_zen, Some(zen_data));
+        let list = notes.list_notes("workflow").unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list.contains(&commit1));
+        assert!(list.contains(&commit2));
+    }
 
-        // Verify default note exists separately
-        let default_note = repo.find_note(None, oid).unwrap();
-        assert_eq!(default_note.message(), Some("default note content"));
+    #[test]
+    fn test_note_exists() {
+        let (temp_dir, commit_sha) = setup_test_repo();
+        let notes = GitNotes::new(temp_dir.path()).unwrap();
+
+        assert!(!notes.note_exists(&commit_sha, "workflow").unwrap());
+
+        let data = TestData {
+            name: "test".to_string(),
+            count: 42,
+        };
+        notes.set_note(&commit_sha, "workflow", &data).unwrap();
+
+        assert!(notes.note_exists(&commit_sha, "workflow").unwrap());
+    }
+
+    #[test]
+    fn test_different_namespaces() {
+        let (temp_dir, commit_sha) = setup_test_repo();
+        let notes = GitNotes::new(temp_dir.path()).unwrap();
+
+        let data1 = TestData {
+            name: "workflow".to_string(),
+            count: 1,
+        };
+        let data2 = TestData {
+            name: "task".to_string(),
+            count: 2,
+        };
+
+        // Set notes in different namespaces
+        notes.set_note(&commit_sha, "workflows", &data1).unwrap();
+        notes.set_note(&commit_sha, "tasks", &data2).unwrap();
+
+        // Each namespace should have its own note
+        let retrieved1: Option<TestData> = notes.get_note(&commit_sha, "workflows").unwrap();
+        let retrieved2: Option<TestData> = notes.get_note(&commit_sha, "tasks").unwrap();
+
+        assert_eq!(retrieved1, Some(data1));
+        assert_eq!(retrieved2, Some(data2));
+
+        // Lists should be separate
+        let workflow_list = notes.list_notes("workflows").unwrap();
+        let task_list = notes.list_notes("tasks").unwrap();
+
+        assert_eq!(workflow_list.len(), 1);
+        assert_eq!(task_list.len(), 1);
     }
 }
