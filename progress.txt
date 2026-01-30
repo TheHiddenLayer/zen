@@ -88,3 +88,31 @@
 - **Tests:** 59 claude tests passing, 176 orchestration tests passing, 454 total tests passing (+7 doc tests)
 - **Summary:** Added session continuation support to ClaudeHeadless with continue_session() and continue_session_with_model() methods using --resume flag. Created SessionManager for tracking active sessions with register/get/remove/clear operations. Enhanced AIHumanProxy with optional Claude backend via ClaudeBackendConfig struct, supporting real Claude responses instead of mock patterns. Added set_session_id() and clear_session() methods for session lifecycle management. Full test coverage for SessionManager operations and AIHumanProxy Claude backend configuration.
 
+## Step 6: Skills Orchestrator Skeleton
+
+### Task 6.1: Create SkillsOrchestrator Structure - COMPLETED
+- **Commit:** 7ac82ec
+- **Files:** src/orchestration/skills.rs, src/orchestration/mod.rs
+- **Tests:** 21 skills tests passing, 475 total tests passing (+7 doc tests)
+- **Summary:** Added SkillsOrchestrator struct that coordinates the full workflow phases by composing AIHumanProxy, AgentPool, WorkflowState, and ClaudeHeadless. Includes WorkflowResult struct with workflow_id, status, and summary fields. Implemented constructor (new) that initializes all components with WorkflowConfig and repo_path. Added execute() method skeleton that runs through all phase stubs (Planning, TaskGeneration, Implementation, Merging, Documentation) with proper phase transition logging. Exports accessible via `zen::orchestration::SkillsOrchestrator` and `zen::orchestration::WorkflowResult`.
+
+### Task 6.2: Implement PhaseController - COMPLETED
+- **Commit:** e384446
+- **Files:** src/orchestration/skills.rs, src/orchestration/mod.rs
+- **Tests:** 53 skills tests passing, 507 total tests passing (+7 doc tests)
+- **Summary:** Added PhaseController struct that manages workflow phase transitions and emits events for TUI updates. Includes PhaseEvent enum (Started, Changed, Completed variants), phase history tracking with timestamps (Instant), elapsed() for duration measurement, transition() with validation following workflow rules, and event emission via tokio mpsc channel. Full test coverage with 32 new tests covering valid/invalid transitions, timing, event emission, and history tracking.
+
+### Task 6.3: Implement Agent Output Monitor Loop - COMPLETED
+- **Commit:** aea47c3
+- **Files:** src/orchestration/skills.rs, src/orchestration/mod.rs
+- **Tests:** 65 skills tests passing, 519 total tests passing (+7 doc tests)
+- **Summary:** Added monitor_agent_output() method to SkillsOrchestrator that implements the core interaction pattern for all skill phases. New types: MonitorConfig (poll_interval, timeout with sensible defaults) and SkillResult (success, output, questions_answered, duration). The loop polls agent output, detects questions and answers via AIHumanProxy, handles completion/error/timeout conditions. Enables autonomous workflow execution without human intervention.
+
+## Step 7: Phase 1 - PDD Skill Integration
+
+### Task 7.1: Implement PDD Phase Runner - COMPLETED
+- **Commit:** c0bb2c1
+- **Files:** src/orchestration/skills.rs, src/orchestration/pool.rs, src/orchestration/mod.rs, src/error.rs
+- **Tests:** 72 skills tests passing, 79 pool tests passing, 534 total tests passing (+7 doc tests)
+- **Summary:** Implemented PDD phase runner that executes /pdd skill as Phase 1 of the workflow. Added PDDResult struct with design_path, plan_path, and research_dir fields, plus from_directory() method with artifact validation. Added spawn_for_skill() method to AgentPool for spawning skill-specific agents with synthetic task IDs and skill-named tmux sessions. Implemented run_pdd_phase() in SkillsOrchestrator that spawns agent, sends /pdd command with user prompt as rough_idea, monitors via AIHumanProxy, and validates PDD artifacts. Added PDDArtifactNotFound error variant. Updated execute() tests to handle planning phase failure in test environment (no tmux).
+

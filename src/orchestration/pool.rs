@@ -550,6 +550,56 @@ impl AgentPool {
     pub fn max_concurrent(&self) -> usize {
         self.max_concurrent
     }
+
+    /// Spawn a new agent for running a skill (without a task assignment).
+    ///
+    /// This is used for skills like /pdd that run at the workflow level,
+    /// not as part of a specific task. The agent gets a synthetic task ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `skill` - The name of the skill to run (e.g., "pdd", "code-task-generator")
+    ///
+    /// # Returns
+    ///
+    /// A cloned `AgentHandle` for the spawned agent, or an error if at capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::AgentPoolFull` if the pool is at capacity.
+    pub async fn spawn_for_skill(&mut self, skill: &str) -> Result<AgentHandle> {
+        if !self.has_capacity() {
+            return Err(crate::error::Error::AgentPoolFull {
+                max: self.max_concurrent,
+            });
+        }
+
+        let agent_id = AgentId::new();
+        // Create a synthetic task ID for the skill execution
+        let task_id = TaskId::new();
+
+        // Create the agent handle with tmux session named after the skill
+        let tmux_session = format!("zen_{}_{}", skill, agent_id.short());
+        let handle = AgentHandle::with_config(
+            agent_id,
+            task_id,
+            tmux_session,
+            PathBuf::new(), // Worktree path will be set when actually spawning
+        );
+
+        self.agents.insert(agent_id, handle.clone());
+
+        // Emit started event
+        let _ = self
+            .event_tx
+            .send(AgentEvent::Started {
+                agent_id,
+                task_id,
+            })
+            .await;
+
+        Ok(handle)
+    }
 }
 
 #[cfg(test)]
@@ -1317,5 +1367,76 @@ mod tests {
         assert_eq!(handle.task_id, cloned.task_id);
         assert_eq!(handle.tmux_session, cloned.tmux_session);
         assert_eq!(handle.worktree_path, cloned.worktree_path);
+    }
+
+    // ========== spawn_for_skill Tests ==========
+
+    #[tokio::test]
+    async fn test_spawn_for_skill_returns_agent_handle() {
+        let (mut pool, _rx) = create_test_pool(3);
+        let result = pool.spawn_for_skill("pdd").await;
+        assert!(result.is_ok());
+        let handle = result.unwrap();
+        assert!(handle.tmux_session.contains("pdd"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_for_skill_tmux_session_includes_skill_name() {
+        let (mut pool, _rx) = create_test_pool(3);
+        let handle = pool.spawn_for_skill("code-task-generator").await.unwrap();
+        assert!(handle.tmux_session.starts_with("zen_code-task-generator_"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_for_skill_adds_to_pool() {
+        let (mut pool, _rx) = create_test_pool(3);
+        let handle = pool.spawn_for_skill("pdd").await.unwrap();
+        assert!(pool.get(&handle.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_for_skill_respects_capacity() {
+        let (mut pool, _rx) = create_test_pool(2);
+        pool.spawn_for_skill("pdd").await.unwrap();
+        pool.spawn_for_skill("pdd").await.unwrap();
+        let result = pool.spawn_for_skill("pdd").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_for_skill_sends_started_event() {
+        let (mut pool, mut rx) = create_test_pool(3);
+        let handle = pool.spawn_for_skill("pdd").await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        if let AgentEvent::Started { agent_id, .. } = event {
+            assert_eq!(agent_id, handle.id);
+        } else {
+            panic!("Expected Started event");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_for_skill_increments_active_count() {
+        let (mut pool, _rx) = create_test_pool(5);
+        assert_eq!(pool.active_count(), 0);
+        pool.spawn_for_skill("pdd").await.unwrap();
+        assert_eq!(pool.active_count(), 1);
+        pool.spawn_for_skill("code-task-generator").await.unwrap();
+        assert_eq!(pool.active_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_for_skill_agent_has_running_status() {
+        let (mut pool, _rx) = create_test_pool(3);
+        let handle = pool.spawn_for_skill("pdd").await.unwrap();
+        assert!(matches!(handle.status, AgentStatus::Running { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_for_skill_agent_has_task_id() {
+        let (mut pool, _rx) = create_test_pool(3);
+        let handle = pool.spawn_for_skill("pdd").await.unwrap();
+        assert!(handle.task_id.is_some());
     }
 }

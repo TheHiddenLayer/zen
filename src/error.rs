@@ -61,6 +61,9 @@ pub enum Error {
 
     #[error("Claude execution failed: {0}")]
     ClaudeExecutionFailed(String),
+
+    #[error("PDD artifact not found: {path}")]
+    PDDArtifactNotFound { path: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
