@@ -4,5 +4,6 @@
 //! for persisting workflow state directly in the git repository.
 
 mod manager;
+mod migration;
 
 pub use manager::GitStateManager;
