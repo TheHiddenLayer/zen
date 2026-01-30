@@ -5,10 +5,10 @@
 
 use crate::core::task::{Task, TaskId};
 use crate::error::{Error, Result};
-use petgraph::algo::is_cyclic_directed;
+use petgraph::algo::{is_cyclic_directed, toposort};
 use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Type of dependency between tasks.
@@ -229,6 +229,120 @@ impl TaskDAG {
     /// This is useful for algorithms that need direct graph access.
     pub fn graph(&self) -> &DiGraph<Task, DependencyType> {
         &self.graph
+    }
+
+    // ========== Scheduling Operations ==========
+
+    /// Get all tasks ready to execute (dependencies satisfied).
+    ///
+    /// A task is ready if all of its dependencies (incoming edges) are
+    /// in the completed set. Tasks with no dependencies are always ready
+    /// if not already completed.
+    ///
+    /// # Arguments
+    /// * `completed` - Set of task IDs that have been completed
+    ///
+    /// # Returns
+    /// Vector of references to tasks that are ready to execute
+    pub fn ready_tasks<'a>(&'a self, completed: &HashSet<TaskId>) -> Vec<&'a Task> {
+        self.graph
+            .node_indices()
+            .filter_map(|index| {
+                let task = self.graph.node_weight(index)?;
+
+                // Skip already completed tasks
+                if completed.contains(&task.id) {
+                    return None;
+                }
+
+                // Check if all dependencies are satisfied
+                let deps_satisfied = self
+                    .graph
+                    .neighbors_directed(index, petgraph::Direction::Incoming)
+                    .all(|dep_index| {
+                        self.graph
+                            .node_weight(dep_index)
+                            .map(|dep_task| completed.contains(&dep_task.id))
+                            .unwrap_or(false)
+                    });
+
+                if deps_satisfied {
+                    Some(task)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Mark a task as completed.
+    ///
+    /// Updates the task's status to Completed and sets its completed_at timestamp.
+    ///
+    /// # Arguments
+    /// * `id` - The ID of the task to complete
+    ///
+    /// # Errors
+    /// Returns an error if the task is not found in the DAG.
+    pub fn complete_task(&mut self, id: &TaskId) -> Result<()> {
+        let task = self
+            .get_task_mut(id)
+            .ok_or_else(|| Error::Validation(format!("Task {} not found in DAG", id)))?;
+
+        task.complete();
+        Ok(())
+    }
+
+    /// Check if all tasks in the DAG are complete.
+    ///
+    /// # Arguments
+    /// * `completed` - Set of task IDs that have been completed
+    ///
+    /// # Returns
+    /// `true` if every task in the DAG is in the completed set
+    pub fn all_complete(&self, completed: &HashSet<TaskId>) -> bool {
+        self.task_index.keys().all(|id| completed.contains(id))
+    }
+
+    /// Get tasks in topological order (respecting dependencies).
+    ///
+    /// Uses petgraph's toposort to produce an ordering where each task
+    /// comes after all of its dependencies.
+    ///
+    /// # Returns
+    /// Vector of task references in topological order.
+    ///
+    /// # Errors
+    /// Returns an error if the graph contains a cycle (should never happen
+    /// since add_dependency validates against cycles).
+    pub fn topological_order(&self) -> Result<Vec<&Task>> {
+        let sorted = toposort(&self.graph, None).map_err(|cycle| {
+            let task_name = self
+                .graph
+                .node_weight(cycle.node_id())
+                .map(|t| t.name.as_str())
+                .unwrap_or("unknown");
+            Error::Validation(format!("Cycle detected at task: {}", task_name))
+        })?;
+
+        Ok(sorted
+            .into_iter()
+            .filter_map(|index| self.graph.node_weight(index))
+            .collect())
+    }
+
+    /// Get the count of pending (not completed) tasks.
+    ///
+    /// # Arguments
+    /// * `completed` - Set of task IDs that have been completed
+    ///
+    /// # Returns
+    /// Number of tasks not in the completed set
+    pub fn pending_count(&self, completed: &HashSet<TaskId>) -> usize {
+        self.task_index
+            .keys()
+            .filter(|id| !completed.contains(id))
+            .count()
     }
 }
 
@@ -900,5 +1014,602 @@ mod tests {
             dag.get_dependency(&id_c, &id_d),
             Some(DependencyType::SemanticDependency { .. })
         ));
+    }
+
+    // ========== Scheduling Operations Tests ==========
+
+    // ready_tasks tests
+
+    #[test]
+    fn test_ready_tasks_empty_dag() {
+        let dag = TaskDAG::new();
+        let completed = HashSet::new();
+
+        let ready = dag.ready_tasks(&completed);
+
+        assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn test_ready_tasks_independent_tasks_nothing_completed() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_d = test_task("task-d");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+        let id_d = task_d.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_d);
+
+        let completed = HashSet::new();
+        let ready = dag.ready_tasks(&completed);
+
+        // All independent tasks are ready
+        assert_eq!(ready.len(), 3);
+        let ready_ids: HashSet<_> = ready.iter().map(|t| t.id).collect();
+        assert!(ready_ids.contains(&id_a));
+        assert!(ready_ids.contains(&id_b));
+        assert!(ready_ids.contains(&id_d));
+    }
+
+    #[test]
+    fn test_ready_tasks_chain_nothing_completed() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+        let id_c = task_c.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+
+        // A -> B -> C
+        dag.add_dependency(&id_a, &id_b, DependencyType::DataDependency)
+            .unwrap();
+        dag.add_dependency(&id_b, &id_c, DependencyType::DataDependency)
+            .unwrap();
+
+        let completed = HashSet::new();
+        let ready = dag.ready_tasks(&completed);
+
+        // Only A has no dependencies
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, id_a);
+    }
+
+    #[test]
+    fn test_ready_tasks_chain_partial_completion() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+        let id_c = task_c.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+
+        // A -> B -> C
+        dag.add_dependency(&id_a, &id_b, DependencyType::DataDependency)
+            .unwrap();
+        dag.add_dependency(&id_b, &id_c, DependencyType::DataDependency)
+            .unwrap();
+
+        let mut completed = HashSet::new();
+        completed.insert(id_a);
+
+        let ready = dag.ready_tasks(&completed);
+
+        // A is done, B is ready
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, id_b);
+    }
+
+    #[test]
+    fn test_ready_tasks_diamond_nothing_completed() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let task_d = test_task("task-d");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+        let id_c = task_c.id;
+        let id_d = task_d.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+        dag.add_task(task_d);
+
+        // A -> C, B -> C, D is independent
+        dag.add_dependency(&id_a, &id_c, DependencyType::DataDependency)
+            .unwrap();
+        dag.add_dependency(&id_b, &id_c, DependencyType::DataDependency)
+            .unwrap();
+
+        let completed = HashSet::new();
+        let ready = dag.ready_tasks(&completed);
+
+        // A, B, D are ready (C needs both A and B)
+        assert_eq!(ready.len(), 3);
+        let ready_ids: HashSet<_> = ready.iter().map(|t| t.id).collect();
+        assert!(ready_ids.contains(&id_a));
+        assert!(ready_ids.contains(&id_b));
+        assert!(ready_ids.contains(&id_d));
+        assert!(!ready_ids.contains(&id_c));
+    }
+
+    #[test]
+    fn test_ready_tasks_diamond_partial_completion() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+        let id_c = task_c.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+
+        // A -> C, B -> C
+        dag.add_dependency(&id_a, &id_c, DependencyType::DataDependency)
+            .unwrap();
+        dag.add_dependency(&id_b, &id_c, DependencyType::DataDependency)
+            .unwrap();
+
+        let mut completed = HashSet::new();
+        completed.insert(id_a);
+
+        let ready = dag.ready_tasks(&completed);
+
+        // Only B is ready (C still needs B)
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, id_b);
+    }
+
+    #[test]
+    fn test_ready_tasks_diamond_fully_ready() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+        let id_c = task_c.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+
+        // A -> C, B -> C
+        dag.add_dependency(&id_a, &id_c, DependencyType::DataDependency)
+            .unwrap();
+        dag.add_dependency(&id_b, &id_c, DependencyType::DataDependency)
+            .unwrap();
+
+        let mut completed = HashSet::new();
+        completed.insert(id_a);
+        completed.insert(id_b);
+
+        let ready = dag.ready_tasks(&completed);
+
+        // C is now ready
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, id_c);
+    }
+
+    #[test]
+    fn test_ready_tasks_excludes_already_completed() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+
+        let mut completed = HashSet::new();
+        completed.insert(id_a);
+
+        let ready = dag.ready_tasks(&completed);
+
+        // A is completed so not returned, B is ready
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, id_b);
+    }
+
+    // complete_task tests
+
+    #[test]
+    fn test_complete_task_success() {
+        let mut dag = TaskDAG::new();
+        let task = test_task("task-a");
+        let id = task.id;
+
+        dag.add_task(task);
+
+        let result = dag.complete_task(&id);
+
+        assert!(result.is_ok());
+        let task = dag.get_task(&id).unwrap();
+        assert!(matches!(
+            task.status,
+            crate::core::task::TaskStatus::Completed
+        ));
+    }
+
+    #[test]
+    fn test_complete_task_sets_completed_at() {
+        let mut dag = TaskDAG::new();
+        let task = test_task("task-a");
+        let id = task.id;
+
+        dag.add_task(task);
+        dag.complete_task(&id).unwrap();
+
+        let task = dag.get_task(&id).unwrap();
+        assert!(task.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_complete_task_not_found() {
+        let mut dag = TaskDAG::new();
+        let id = TaskId::new();
+
+        let result = dag.complete_task(&id);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    // all_complete tests
+
+    #[test]
+    fn test_all_complete_empty_dag() {
+        let dag = TaskDAG::new();
+        let completed = HashSet::new();
+
+        assert!(dag.all_complete(&completed));
+    }
+
+    #[test]
+    fn test_all_complete_nothing_completed() {
+        let mut dag = TaskDAG::new();
+        dag.add_task(test_task("task-a"));
+        dag.add_task(test_task("task-b"));
+        dag.add_task(test_task("task-c"));
+
+        let completed = HashSet::new();
+
+        assert!(!dag.all_complete(&completed));
+    }
+
+    #[test]
+    fn test_all_complete_some_completed() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+
+        let mut completed = HashSet::new();
+        completed.insert(id_a);
+        completed.insert(id_b);
+
+        assert!(!dag.all_complete(&completed));
+    }
+
+    #[test]
+    fn test_all_complete_all_completed() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let task_d = test_task("task-d");
+        let task_e = test_task("task-e");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+        let id_c = task_c.id;
+        let id_d = task_d.id;
+        let id_e = task_e.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+        dag.add_task(task_d);
+        dag.add_task(task_e);
+
+        let mut completed = HashSet::new();
+        completed.insert(id_a);
+        completed.insert(id_b);
+        completed.insert(id_c);
+        completed.insert(id_d);
+        completed.insert(id_e);
+
+        assert!(dag.all_complete(&completed));
+    }
+
+    // topological_order tests
+
+    #[test]
+    fn test_topological_order_empty_dag() {
+        let dag = TaskDAG::new();
+
+        let order = dag.topological_order().unwrap();
+
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn test_topological_order_linear_chain() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+        let id_c = task_c.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+
+        // A -> B -> C
+        dag.add_dependency(&id_a, &id_b, DependencyType::DataDependency)
+            .unwrap();
+        dag.add_dependency(&id_b, &id_c, DependencyType::DataDependency)
+            .unwrap();
+
+        let order = dag.topological_order().unwrap();
+
+        assert_eq!(order.len(), 3);
+
+        // Find positions
+        let pos_a = order.iter().position(|t| t.id == id_a).unwrap();
+        let pos_b = order.iter().position(|t| t.id == id_b).unwrap();
+        let pos_c = order.iter().position(|t| t.id == id_c).unwrap();
+
+        // A must come before B, B must come before C
+        assert!(pos_a < pos_b);
+        assert!(pos_b < pos_c);
+    }
+
+    #[test]
+    fn test_topological_order_diamond() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+        let id_c = task_c.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+
+        // A -> C, B -> C
+        dag.add_dependency(&id_a, &id_c, DependencyType::DataDependency)
+            .unwrap();
+        dag.add_dependency(&id_b, &id_c, DependencyType::DataDependency)
+            .unwrap();
+
+        let order = dag.topological_order().unwrap();
+
+        assert_eq!(order.len(), 3);
+
+        // Find positions
+        let pos_a = order.iter().position(|t| t.id == id_a).unwrap();
+        let pos_b = order.iter().position(|t| t.id == id_b).unwrap();
+        let pos_c = order.iter().position(|t| t.id == id_c).unwrap();
+
+        // A and B must come before C
+        assert!(pos_a < pos_c);
+        assert!(pos_b < pos_c);
+    }
+
+    #[test]
+    fn test_topological_order_multiple_subgraphs() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let task_d = test_task("task-d");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+        let id_c = task_c.id;
+        let id_d = task_d.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+        dag.add_task(task_d);
+
+        // A -> B, C -> D (two independent chains)
+        dag.add_dependency(&id_a, &id_b, DependencyType::DataDependency)
+            .unwrap();
+        dag.add_dependency(&id_c, &id_d, DependencyType::DataDependency)
+            .unwrap();
+
+        let order = dag.topological_order().unwrap();
+
+        assert_eq!(order.len(), 4);
+
+        // Find positions
+        let pos_a = order.iter().position(|t| t.id == id_a).unwrap();
+        let pos_b = order.iter().position(|t| t.id == id_b).unwrap();
+        let pos_c = order.iter().position(|t| t.id == id_c).unwrap();
+        let pos_d = order.iter().position(|t| t.id == id_d).unwrap();
+
+        // A before B, C before D
+        assert!(pos_a < pos_b);
+        assert!(pos_c < pos_d);
+    }
+
+    #[test]
+    fn test_topological_order_independent_tasks() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+
+        // No dependencies - any order is valid
+        let order = dag.topological_order().unwrap();
+
+        assert_eq!(order.len(), 3);
+    }
+
+    // pending_count tests
+
+    #[test]
+    fn test_pending_count_empty_dag() {
+        let dag = TaskDAG::new();
+        let completed = HashSet::new();
+
+        assert_eq!(dag.pending_count(&completed), 0);
+    }
+
+    #[test]
+    fn test_pending_count_all_pending() {
+        let mut dag = TaskDAG::new();
+        dag.add_task(test_task("task-a"));
+        dag.add_task(test_task("task-b"));
+        dag.add_task(test_task("task-c"));
+        dag.add_task(test_task("task-d"));
+        dag.add_task(test_task("task-e"));
+
+        let completed = HashSet::new();
+
+        assert_eq!(dag.pending_count(&completed), 5);
+    }
+
+    #[test]
+    fn test_pending_count_some_completed() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let task_d = test_task("task-d");
+        let task_e = test_task("task-e");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+        dag.add_task(task_d);
+        dag.add_task(task_e);
+
+        let mut completed = HashSet::new();
+        completed.insert(id_a);
+        completed.insert(id_b);
+
+        assert_eq!(dag.pending_count(&completed), 3);
+    }
+
+    #[test]
+    fn test_pending_count_all_completed() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+        let id_c = task_c.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+
+        let mut completed = HashSet::new();
+        completed.insert(id_a);
+        completed.insert(id_b);
+        completed.insert(id_c);
+
+        assert_eq!(dag.pending_count(&completed), 0);
+    }
+
+    // Integration test: Full scheduling workflow
+    #[test]
+    fn test_scheduling_workflow() {
+        let mut dag = TaskDAG::new();
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let id_a = task_a.id;
+        let id_b = task_b.id;
+        let id_c = task_c.id;
+
+        dag.add_task(task_a);
+        dag.add_task(task_b);
+        dag.add_task(task_c);
+
+        // A -> C, B -> C (diamond pattern)
+        dag.add_dependency(&id_a, &id_c, DependencyType::DataDependency)
+            .unwrap();
+        dag.add_dependency(&id_b, &id_c, DependencyType::DataDependency)
+            .unwrap();
+
+        let mut completed = HashSet::new();
+
+        // Initially: A and B are ready
+        let ready = dag.ready_tasks(&completed);
+        assert_eq!(ready.len(), 2);
+        assert!(!dag.all_complete(&completed));
+        assert_eq!(dag.pending_count(&completed), 3);
+
+        // Complete A
+        dag.complete_task(&id_a).unwrap();
+        completed.insert(id_a);
+
+        // Now only B is ready (C still needs B)
+        let ready = dag.ready_tasks(&completed);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, id_b);
+        assert!(!dag.all_complete(&completed));
+        assert_eq!(dag.pending_count(&completed), 2);
+
+        // Complete B
+        dag.complete_task(&id_b).unwrap();
+        completed.insert(id_b);
+
+        // Now C is ready
+        let ready = dag.ready_tasks(&completed);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, id_c);
+        assert!(!dag.all_complete(&completed));
+        assert_eq!(dag.pending_count(&completed), 1);
+
+        // Complete C
+        dag.complete_task(&id_c).unwrap();
+        completed.insert(id_c);
+
+        // All done
+        let ready = dag.ready_tasks(&completed);
+        assert!(ready.is_empty());
+        assert!(dag.all_complete(&completed));
+        assert_eq!(dag.pending_count(&completed), 0);
     }
 }
