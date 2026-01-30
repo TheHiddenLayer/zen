@@ -8,6 +8,7 @@ pub mod log;
 pub mod session;
 pub mod tmux;
 pub mod util;
+pub mod workflow;
 
 // Decoupled game loop architecture
 pub mod actors;
