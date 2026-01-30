@@ -8,6 +8,7 @@
 
 mod ai_human;
 mod claude;
+pub mod detection;
 mod pool;
 mod skills;
 

@@ -6,6 +6,7 @@
 
 use crate::agent::{AgentId, AgentStatus};
 use crate::error::Result;
+use crate::orchestration::detection;
 use crate::tmux::Tmux;
 use crate::workflow::TaskId;
 use std::collections::HashMap;
@@ -102,34 +103,12 @@ impl AgentOutput {
     }
 
     /// Check if content contains question patterns.
+    ///
+    /// Delegates to the detection module for robust question detection,
+    /// including direct questions, numbered options, yes/no prompts, and
+    /// input prompts.
     fn contains_question_pattern(content: &str) -> bool {
-        let lower = content.to_lowercase();
-
-        // Check for question mark at end of a line
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.ends_with('?') {
-                return true;
-            }
-        }
-
-        // Check for common question phrases
-        let question_patterns = [
-            "do you want",
-            "would you like",
-            "should i",
-            "shall i",
-            "can i",
-            "may i",
-            "please confirm",
-            "please select",
-            "choose one",
-            "select an option",
-            "enter your",
-            "type your",
-        ];
-
-        question_patterns.iter().any(|p| lower.contains(p))
+        detection::is_question(content)
     }
 
     /// Check if content contains completion patterns.

@@ -46,6 +46,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 uuid = { version = "1", features = ["v4", "serde"] }
 which = "8"
+regex = "1"
 
 # ANSI parsing
 ansi-to-tui = "7"
