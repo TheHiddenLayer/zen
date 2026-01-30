@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::core::task::{Task, TaskId};
 use crate::git::GitOps;
 use crate::git_notes::GitNotes;
 use crate::git_refs::GitRefs;
@@ -10,6 +11,9 @@ use crate::{zlog_debug, Result};
 
 /// The prefix for workflow refs and notes namespaces.
 const WORKFLOWS_PREFIX: &str = "workflows";
+
+/// The prefix for task refs and notes namespaces.
+const TASKS_PREFIX: &str = "tasks";
 
 /// Unified manager for git-native state persistence.
 ///
@@ -183,6 +187,140 @@ impl GitStateManager {
         self.refs.delete_ref(&ref_name)?;
 
         zlog_debug!("Deleted workflow {}", id);
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Task Persistence Methods
+    // -------------------------------------------------------------------------
+
+    /// Build the ref name for a task ID.
+    fn task_ref_name(id: &TaskId) -> String {
+        format!("{}/{}", TASKS_PREFIX, id)
+    }
+
+    /// Build the notes namespace for a task ID.
+    /// Each task gets its own namespace to avoid collisions when multiple
+    /// tasks share the same commit.
+    fn task_notes_namespace(id: &TaskId) -> String {
+        format!("{}/{}", TASKS_PREFIX, id)
+    }
+
+    /// Save a task to git-native storage.
+    ///
+    /// Creates or updates:
+    /// - A ref at `refs/zen/tasks/{id}` pointing to the current HEAD commit
+    /// - A note on the target commit containing the task JSON
+    ///
+    /// # Errors
+    /// Returns an error if git operations fail.
+    pub fn save_task(&self, task: &Task) -> Result<()> {
+        zlog_debug!("GitStateManager::save_task id={}", task.id);
+
+        let ref_name = Self::task_ref_name(&task.id);
+        let head_sha = self.ops.head_commit()?;
+
+        // Create or update the ref
+        if self.refs.ref_exists(&ref_name)? {
+            self.refs.update_ref(&ref_name, &head_sha)?;
+        } else {
+            self.refs.create_ref(&ref_name, &head_sha)?;
+        }
+
+        // Attach task as a note on the commit (using per-task namespace)
+        let notes_ns = Self::task_notes_namespace(&task.id);
+        self.notes.set_note(&head_sha, &notes_ns, task)?;
+
+        zlog_debug!(
+            "Saved task {} to ref {} with note on {}",
+            task.id,
+            ref_name,
+            head_sha
+        );
+        Ok(())
+    }
+
+    /// Load a task from git-native storage.
+    ///
+    /// Returns `None` if the task doesn't exist.
+    ///
+    /// # Errors
+    /// Returns an error if git operations or deserialization fail.
+    pub fn load_task(&self, id: &TaskId) -> Result<Option<Task>> {
+        zlog_debug!("GitStateManager::load_task id={}", id);
+
+        let ref_name = Self::task_ref_name(id);
+
+        // Read the ref to get the commit SHA
+        let commit_sha = match self.refs.read_ref(&ref_name)? {
+            Some(sha) => sha,
+            None => {
+                zlog_debug!("Task {} not found (no ref)", id);
+                return Ok(None);
+            }
+        };
+
+        // Get the note from that commit (using per-task namespace)
+        let notes_ns = Self::task_notes_namespace(id);
+        let task: Option<Task> = self.notes.get_note(&commit_sha, &notes_ns)?;
+        zlog_debug!(
+            "Loaded task {} from commit {}: {:?}",
+            id,
+            commit_sha,
+            task.is_some()
+        );
+        Ok(task)
+    }
+
+    /// List all saved tasks.
+    ///
+    /// Returns an empty vector if no tasks exist.
+    ///
+    /// # Errors
+    /// Returns an error if git operations or deserialization fail.
+    pub fn list_tasks(&self) -> Result<Vec<Task>> {
+        zlog_debug!("GitStateManager::list_tasks");
+
+        let ref_names = self.refs.list_refs(Some(&format!("{}/", TASKS_PREFIX)))?;
+        let mut tasks = Vec::new();
+
+        for ref_name in ref_names {
+            // Extract task ID from ref name (tasks/{id})
+            if let Some(id_str) = ref_name.strip_prefix(&format!("{}/", TASKS_PREFIX)) {
+                if let Ok(id) = id_str.parse::<TaskId>() {
+                    if let Some(task) = self.load_task(&id)? {
+                        tasks.push(task);
+                    }
+                }
+            }
+        }
+
+        zlog_debug!("Listed {} tasks", tasks.len());
+        Ok(tasks)
+    }
+
+    /// Delete a task from git-native storage.
+    ///
+    /// This is idempotent - no error if the task doesn't exist.
+    ///
+    /// # Errors
+    /// Returns an error if git operations fail.
+    pub fn delete_task(&self, id: &TaskId) -> Result<()> {
+        zlog_debug!("GitStateManager::delete_task id={}", id);
+
+        let ref_name = Self::task_ref_name(id);
+
+        // Get the commit SHA before deleting the ref
+        if let Some(commit_sha) = self.refs.read_ref(&ref_name)? {
+            // Delete the note first (using per-task namespace)
+            let notes_ns = Self::task_notes_namespace(id);
+            self.notes.delete_note(&commit_sha, &notes_ns)?;
+        }
+
+        // Delete the ref (idempotent)
+        self.refs.delete_ref(&ref_name)?;
+
+        zlog_debug!("Deleted task {}", id);
         Ok(())
     }
 }
@@ -464,5 +602,181 @@ mod tests {
         assert_eq!(loaded.phase, WorkflowPhase::Complete);
         assert!(loaded.started_at.is_some());
         assert!(loaded.completed_at.is_some());
+    }
+
+    // -------------------------------------------------------------------------
+    // Task Persistence Tests
+    // -------------------------------------------------------------------------
+
+    use crate::core::task::{Task, TaskStatus};
+
+    #[test]
+    fn test_save_and_load_task_roundtrip() {
+        let (temp_dir, _) = setup_test_repo();
+        let manager = GitStateManager::new(temp_dir.path()).unwrap();
+
+        let task = Task::new("create-user-model", "Create the user model");
+        let id = task.id;
+
+        // Save the task
+        manager.save_task(&task).unwrap();
+
+        // Load it back
+        let loaded = manager.load_task(&id).unwrap();
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+
+        // Verify fields match
+        assert_eq!(loaded.id, task.id);
+        assert_eq!(loaded.name, task.name);
+        assert_eq!(loaded.description, task.description);
+        assert_eq!(loaded.status, task.status);
+    }
+
+    #[test]
+    fn test_save_task_overwrites_existing() {
+        let (temp_dir, _) = setup_test_repo();
+        let manager = GitStateManager::new(temp_dir.path()).unwrap();
+
+        let mut task = Task::new("test-task", "Test description");
+        let id = task.id;
+
+        // Save initial version
+        manager.save_task(&task).unwrap();
+
+        // Modify and save again
+        task.start();
+        assert_eq!(task.status, TaskStatus::Running);
+        manager.save_task(&task).unwrap();
+
+        // Load and verify updated version
+        let loaded = manager.load_task(&id).unwrap().unwrap();
+        assert_eq!(loaded.status, TaskStatus::Running);
+        assert!(loaded.started_at.is_some());
+    }
+
+    #[test]
+    fn test_load_nonexistent_task_returns_none() {
+        let (temp_dir, _) = setup_test_repo();
+        let manager = GitStateManager::new(temp_dir.path()).unwrap();
+
+        let nonexistent_id = TaskId::new();
+        let result = manager.load_task(&nonexistent_id).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_list_multiple_tasks() {
+        let (temp_dir, _) = setup_test_repo();
+        let manager = GitStateManager::new(temp_dir.path()).unwrap();
+
+        let task1 = Task::new("task-1", "First task");
+        let task2 = Task::new("task-2", "Second task");
+        let task3 = Task::new("task-3", "Third task");
+
+        let id1 = task1.id;
+        let id2 = task2.id;
+        let id3 = task3.id;
+
+        // Save all three
+        manager.save_task(&task1).unwrap();
+        manager.save_task(&task2).unwrap();
+        manager.save_task(&task3).unwrap();
+
+        // List all
+        let tasks = manager.list_tasks().unwrap();
+        assert_eq!(tasks.len(), 3);
+
+        // Verify all IDs are present
+        let ids: Vec<TaskId> = tasks.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&id1));
+        assert!(ids.contains(&id2));
+        assert!(ids.contains(&id3));
+    }
+
+    #[test]
+    fn test_list_tasks_empty() {
+        let (temp_dir, _) = setup_test_repo();
+        let manager = GitStateManager::new(temp_dir.path()).unwrap();
+
+        let tasks = manager.list_tasks().unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn test_delete_task() {
+        let (temp_dir, _) = setup_test_repo();
+        let manager = GitStateManager::new(temp_dir.path()).unwrap();
+
+        let task = Task::new("delete-me", "Task to delete");
+        let id = task.id;
+
+        // Save the task
+        manager.save_task(&task).unwrap();
+
+        // Verify it exists
+        assert!(manager.load_task(&id).unwrap().is_some());
+
+        // Delete it
+        manager.delete_task(&id).unwrap();
+
+        // Verify it's gone
+        assert!(manager.load_task(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_nonexistent_task_is_idempotent() {
+        let (temp_dir, _) = setup_test_repo();
+        let manager = GitStateManager::new(temp_dir.path()).unwrap();
+
+        let nonexistent_id = TaskId::new();
+
+        // Should not error
+        let result = manager.delete_task(&nonexistent_id);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_task_with_full_lifecycle_roundtrip() {
+        let (temp_dir, _) = setup_test_repo();
+        let manager = GitStateManager::new(temp_dir.path()).unwrap();
+
+        let mut task = Task::new("complete-task", "A task that completes");
+        task.start();
+        task.complete();
+        task.set_commit("abc123def456");
+        let id = task.id;
+
+        manager.save_task(&task).unwrap();
+
+        let loaded = manager.load_task(&id).unwrap().unwrap();
+        assert_eq!(loaded.status, TaskStatus::Completed);
+        assert!(loaded.started_at.is_some());
+        assert!(loaded.completed_at.is_some());
+        assert_eq!(loaded.commit_hash, Some("abc123def456".to_string()));
+    }
+
+    #[test]
+    fn test_task_with_worktree_roundtrip() {
+        use std::path::PathBuf;
+
+        let (temp_dir, _) = setup_test_repo();
+        let manager = GitStateManager::new(temp_dir.path()).unwrap();
+
+        let mut task = Task::new("task-with-worktree", "Task with worktree");
+        task.set_worktree(
+            PathBuf::from("/Users/test/.zen/worktrees/task-001"),
+            "zen/task/task-001",
+        );
+        let id = task.id;
+
+        manager.save_task(&task).unwrap();
+
+        let loaded = manager.load_task(&id).unwrap().unwrap();
+        assert_eq!(
+            loaded.worktree_path,
+            Some(PathBuf::from("/Users/test/.zen/worktrees/task-001"))
+        );
+        assert_eq!(loaded.branch_name, Some("zen/task/task-001".to_string()));
     }
 }

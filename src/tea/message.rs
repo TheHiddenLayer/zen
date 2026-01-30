@@ -5,6 +5,8 @@
 
 use crossterm::event::KeyEvent;
 
+use crate::agent::AgentId;
+use crate::core::task::TaskId;
 use crate::session::{Session, SessionId};
 
 /// Input messages to the update function.
@@ -33,4 +35,34 @@ pub enum Message {
     // State persistence
     StateSaved,
     StateSaveFailed(String),
+
+    // Task execution events (from Scheduler)
+    /// A task has been started by an agent.
+    TaskStarted {
+        /// The task that was started.
+        task_id: TaskId,
+        /// The agent assigned to the task.
+        agent_id: AgentId,
+    },
+    /// Progress update for task execution.
+    TaskProgress {
+        /// Number of completed tasks.
+        completed: usize,
+        /// Total number of tasks.
+        total: usize,
+    },
+    /// A task completed successfully.
+    TaskCompleted {
+        /// The task that completed.
+        task_id: TaskId,
+        /// The commit hash from the task's work.
+        commit: String,
+    },
+    /// A task failed with an error.
+    TaskFailed {
+        /// The task that failed.
+        task_id: TaskId,
+        /// Error message describing the failure.
+        error: String,
+    },
 }

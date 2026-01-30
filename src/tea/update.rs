@@ -181,6 +181,35 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Command> {
             zlog_warn!("Message::StateSaveFailed err={}", err);
             set_error(model, format!("Failed to save state: {}", err));
         }
+
+        // Task execution events - currently logged only, TUI updates in Step 16
+        Message::TaskStarted { task_id, agent_id } => {
+            zlog_debug!(
+                "Message::TaskStarted task_id={} agent_id={}",
+                task_id,
+                agent_id
+            );
+        }
+
+        Message::TaskProgress { completed, total } => {
+            zlog_debug!(
+                "Message::TaskProgress completed={} total={}",
+                completed,
+                total
+            );
+        }
+
+        Message::TaskCompleted { task_id, commit } => {
+            zlog_debug!(
+                "Message::TaskCompleted task_id={} commit={}",
+                task_id,
+                commit
+            );
+        }
+
+        Message::TaskFailed { task_id, error } => {
+            zlog_warn!("Message::TaskFailed task_id={} error={}", task_id, error);
+        }
     }
 
     cmds

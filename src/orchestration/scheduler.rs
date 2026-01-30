@@ -6,9 +6,11 @@
 
 use crate::agent::AgentId;
 use crate::core::dag::TaskDAG;
-use crate::core::task::TaskId;
+use crate::core::task::{Task, TaskId};
 use crate::error::Result;
+use crate::git::GitOps;
 use crate::orchestration::pool::{AgentEvent, AgentPool};
+use crate::state::GitStateManager;
 use crate::workflow::TaskId as WorkflowTaskId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -50,6 +52,13 @@ pub enum SchedulerEvent {
         /// Error message describing the failure.
         error: String,
     },
+    /// Progress update for task execution.
+    TaskProgress {
+        /// Number of completed tasks.
+        completed: usize,
+        /// Total number of tasks.
+        total: usize,
+    },
     /// All tasks in the DAG have completed.
     AllTasksComplete,
 }
@@ -90,6 +99,7 @@ impl ImplResult {
 /// ```ignore
 /// use tokio::sync::{mpsc, RwLock};
 /// use std::sync::Arc;
+/// use std::path::PathBuf;
 /// use zen::core::dag::TaskDAG;
 /// use zen::orchestration::{AgentPool, Scheduler, SchedulerEvent};
 ///
@@ -98,7 +108,7 @@ impl ImplResult {
 /// let pool = Arc::new(RwLock::new(AgentPool::new(4, pool_tx)));
 /// let (event_tx, mut event_rx) = mpsc::channel(100);
 ///
-/// let mut scheduler = Scheduler::new(dag, pool, event_tx);
+/// let mut scheduler = Scheduler::new(dag, pool, event_tx, PathBuf::from("."));
 /// let results = scheduler.run().await?;
 /// ```
 pub struct Scheduler {
@@ -114,6 +124,10 @@ pub struct Scheduler {
     agent_tasks: HashMap<AgentId, TaskId>,
     /// Results collected from completed tasks.
     results: Vec<ImplResult>,
+    /// Path to the git repository.
+    repo_path: PathBuf,
+    /// Optional GitStateManager for persisting task state.
+    state_manager: Option<GitStateManager>,
 }
 
 impl Scheduler {
@@ -124,10 +138,12 @@ impl Scheduler {
     /// * `dag` - The task dependency graph to execute
     /// * `agent_pool` - Pool of agents for task execution
     /// * `event_tx` - Channel for emitting scheduler events
+    /// * `repo_path` - Path to the git repository for worktree creation
     pub fn new(
         dag: Arc<RwLock<TaskDAG>>,
         agent_pool: Arc<RwLock<AgentPool>>,
         event_tx: mpsc::Sender<SchedulerEvent>,
+        repo_path: PathBuf,
     ) -> Self {
         Self {
             dag,
@@ -136,7 +152,18 @@ impl Scheduler {
             completed: HashSet::new(),
             agent_tasks: HashMap::new(),
             results: Vec::new(),
+            repo_path,
+            state_manager: None,
         }
+    }
+
+    /// Set the GitStateManager for persisting task state.
+    ///
+    /// When set, the scheduler will persist task status changes to
+    /// git-native storage via save_task() calls.
+    pub fn with_state_manager(mut self, state_manager: GitStateManager) -> Self {
+        self.state_manager = Some(state_manager);
+        self
     }
 
     /// Get the set of completed task IDs.
@@ -153,6 +180,50 @@ impl Scheduler {
     /// Get the number of active (in-progress) tasks.
     pub fn active_count(&self) -> usize {
         self.agent_tasks.len()
+    }
+
+    /// Get the total number of tasks in the DAG.
+    pub async fn total_tasks(&self) -> usize {
+        let dag = self.dag.read().await;
+        dag.task_count()
+    }
+
+    /// Get the number of completed tasks.
+    pub fn completed_count(&self) -> usize {
+        self.completed.len()
+    }
+
+    /// Calculate the progress percentage (0-100).
+    ///
+    /// Returns 100 if there are no tasks, otherwise returns
+    /// (completed / total) * 100.
+    pub async fn progress_percentage(&self) -> u8 {
+        let total = self.total_tasks().await;
+        if total == 0 {
+            return 100;
+        }
+        let completed = self.completed_count();
+        ((completed * 100) / total) as u8
+    }
+
+    /// Emit a progress event with current completion status.
+    async fn emit_progress(&self) {
+        let total = self.total_tasks().await;
+        let completed = self.completed_count();
+        let _ = self
+            .event_tx
+            .send(SchedulerEvent::TaskProgress { completed, total })
+            .await;
+    }
+
+    /// Persist task state via GitStateManager if configured.
+    fn persist_task(&self, task: &Task) {
+        if let Some(ref state_manager) = self.state_manager {
+            if let Err(e) = state_manager.save_task(task) {
+                // Log but don't fail - persistence is best-effort
+                eprintln!("Warning: failed to persist task {}: {}", task.id, e);
+            }
+        }
     }
 
     /// Get ready tasks that can be scheduled.
@@ -190,24 +261,37 @@ impl Scheduler {
                 break;
             }
 
-            // Spawn agent for task
-            // Convert TaskId to WorkflowTaskId for AgentPool compatibility
-            let workflow_task_id = to_workflow_task_id(&task_id);
-            let agent_id = {
-                let mut pool = self.agent_pool.write().await;
-                pool.spawn(&workflow_task_id, "code-assist").await?
+            // Get the task from DAG
+            let task = {
+                let dag = self.dag.read().await;
+                dag.get_task(&task_id).cloned()
             };
+
+            let Some(task) = task else {
+                continue;
+            };
+
+            // Spawn agent for the task with worktree isolation
+            let agent_id = self.spawn_task(&task).await?;
 
             // Track the assignment
             self.agent_tasks.insert(agent_id, task_id);
 
-            // Mark task as started in DAG
-            {
+            // Mark task as started in DAG and update with worktree info
+            let started_task = {
                 let mut dag = self.dag.write().await;
                 if let Some(task) = dag.get_task_mut(&task_id) {
                     task.start();
                     task.assign_agent(agent_id);
+                    Some(task.clone())
+                } else {
+                    None
                 }
+            };
+
+            // Persist task state if state manager is configured
+            if let Some(task) = started_task {
+                self.persist_task(&task);
             }
 
             // Emit event
@@ -220,6 +304,70 @@ impl Scheduler {
         }
 
         Ok(dispatched)
+    }
+
+    /// Spawn an agent for a task with worktree isolation.
+    ///
+    /// This method:
+    /// 1. Creates a git worktree at `~/.zen/worktrees/{task-id}`
+    /// 2. Creates a branch `zen/task/{task-id}`
+    /// 3. Spawns an agent in that worktree
+    /// 4. Updates the task in the DAG with worktree_path and agent_id
+    ///
+    /// # Arguments
+    ///
+    /// * `task` - The task to spawn an agent for
+    ///
+    /// # Returns
+    ///
+    /// The ID of the spawned agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The git worktree cannot be created
+    /// - The agent pool is at capacity
+    pub async fn spawn_task(&mut self, task: &Task) -> Result<AgentId> {
+        // Generate worktree path and branch name
+        let task_id_short = task.id.short();
+        let worktree_path = Self::worktree_path_for_task(&task.id);
+        let branch_name = format!("zen/task/{}", task_id_short);
+
+        // Create worktree with isolated branch
+        let git_ops = GitOps::new(&self.repo_path)?;
+
+        // Remove any existing worktree at this path (cleanup from previous failed runs)
+        if worktree_path.exists() {
+            let _ = git_ops.remove_worktree(&worktree_path);
+        }
+
+        // Create the worktree
+        git_ops.create_worktree(&branch_name, &worktree_path)?;
+
+        // Spawn agent in the worktree
+        let workflow_task_id = to_workflow_task_id(&task.id);
+        let agent_id = {
+            let mut pool = self.agent_pool.write().await;
+            pool.spawn(&workflow_task_id, "code-assist").await?
+        };
+
+        // Update task in DAG with worktree info
+        {
+            let mut dag = self.dag.write().await;
+            if let Some(dag_task) = dag.get_task_mut(&task.id) {
+                dag_task.set_worktree(worktree_path, &branch_name);
+            }
+        }
+
+        Ok(agent_id)
+    }
+
+    /// Get the worktree path for a task.
+    ///
+    /// Worktrees are stored at `~/.zen/worktrees/{task-id-short}`.
+    pub fn worktree_path_for_task(task_id: &TaskId) -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        home.join(".zen").join("worktrees").join(task_id.short())
     }
 
     /// Handle a task completion.
@@ -236,28 +384,35 @@ impl Scheduler {
             None => return Ok(()), // Agent not tracked, ignore
         };
 
-        // Mark task complete in DAG
-        {
+        // Mark task complete in DAG and get the updated task for persistence
+        let completed_task = {
             let mut dag = self.dag.write().await;
             dag.complete_task(&task_id)?;
             if let Some(task) = dag.get_task_mut(&task_id) {
                 task.set_commit(&commit);
+                Some(task.clone())
+            } else {
+                None
             }
+        };
+
+        // Persist task state if state manager is configured
+        if let Some(task) = &completed_task {
+            self.persist_task(task);
         }
 
         // Add to completed set
         self.completed.insert(task_id);
 
         // Get worktree path for result
-        let worktree = {
-            let dag = self.dag.read().await;
-            dag.get_task(&task_id)
-                .and_then(|t| t.worktree_path.clone())
-                .unwrap_or_default()
-        };
+        let worktree = completed_task
+            .as_ref()
+            .and_then(|t| t.worktree_path.clone())
+            .unwrap_or_default();
 
         // Record result
-        self.results.push(ImplResult::new(task_id, worktree, commit.clone()));
+        self.results
+            .push(ImplResult::new(task_id, worktree, commit.clone()));
 
         // Terminate the agent in the pool to free capacity
         {
@@ -268,8 +423,14 @@ impl Scheduler {
         // Emit completion event
         let _ = self
             .event_tx
-            .send(SchedulerEvent::TaskCompleted { task_id, commit })
+            .send(SchedulerEvent::TaskCompleted {
+                task_id,
+                commit: commit.clone(),
+            })
             .await;
+
+        // Emit progress event
+        self.emit_progress().await;
 
         // Check if all complete
         if self.all_complete().await {
@@ -289,12 +450,20 @@ impl Scheduler {
             None => return Ok(()), // Agent not tracked, ignore
         };
 
-        // Mark task failed in DAG
-        {
+        // Mark task failed in DAG and get the updated task for persistence
+        let failed_task = {
             let mut dag = self.dag.write().await;
             if let Some(task) = dag.get_task_mut(&task_id) {
                 task.fail(&error);
+                Some(task.clone())
+            } else {
+                None
             }
+        };
+
+        // Persist task state if state manager is configured
+        if let Some(task) = &failed_task {
+            self.persist_task(task);
         }
 
         // Terminate the agent in the pool to free capacity
@@ -306,10 +475,7 @@ impl Scheduler {
         // Emit failure event
         let _ = self
             .event_tx
-            .send(SchedulerEvent::TaskFailed {
-                task_id,
-                error,
-            })
+            .send(SchedulerEvent::TaskFailed { task_id, error })
             .await;
 
         Ok(())
@@ -400,8 +566,65 @@ impl Scheduler {
 mod tests {
     use super::*;
     use crate::core::task::Task;
+    use tempfile::TempDir;
 
-    // Helper to create test components
+    // Helper to create test components with a temporary git repo
+    fn create_test_scheduler_with_repo(
+        max_agents: usize,
+    ) -> (
+        Scheduler,
+        Arc<RwLock<TaskDAG>>,
+        Arc<RwLock<AgentPool>>,
+        mpsc::Receiver<SchedulerEvent>,
+        mpsc::Receiver<AgentEvent>,
+        TempDir,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        // Initialize a git repo in the temp directory
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        // Configure git user for commits
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        // Create an initial commit so we have something to branch from
+        std::fs::write(temp_dir.path().join("README.md"), "# Test").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+
+        let dag = Arc::new(RwLock::new(TaskDAG::new()));
+        let (pool_tx, pool_rx) = mpsc::channel(100);
+        let pool = Arc::new(RwLock::new(AgentPool::new(max_agents, pool_tx)));
+        let (event_tx, event_rx) = mpsc::channel(100);
+
+        let scheduler = Scheduler::new(
+            Arc::clone(&dag),
+            Arc::clone(&pool),
+            event_tx,
+            temp_dir.path().to_path_buf(),
+        );
+        (scheduler, dag, pool, event_rx, pool_rx, temp_dir)
+    }
+
+    // Helper to create test components (for tests that don't need actual git operations)
     fn create_test_scheduler(
         max_agents: usize,
     ) -> (
@@ -416,7 +639,13 @@ mod tests {
         let pool = Arc::new(RwLock::new(AgentPool::new(max_agents, pool_tx)));
         let (event_tx, event_rx) = mpsc::channel(100);
 
-        let scheduler = Scheduler::new(Arc::clone(&dag), Arc::clone(&pool), event_tx);
+        // Use current directory as repo_path (won't actually create worktrees in these tests)
+        let scheduler = Scheduler::new(
+            Arc::clone(&dag),
+            Arc::clone(&pool),
+            event_tx,
+            PathBuf::from("."),
+        );
         (scheduler, dag, pool, event_rx, pool_rx)
     }
 
@@ -1103,5 +1332,474 @@ mod tests {
         // Then appropriate SchedulerEvents are sent
         let event = event_rx.recv().await.unwrap();
         assert!(matches!(event, SchedulerEvent::TaskStarted { .. }));
+    }
+
+    // ========== spawn_task Tests ==========
+
+    #[tokio::test]
+    async fn test_spawn_task_creates_worktree() {
+        // Given a task to spawn
+        let (mut scheduler, dag, _, _, _, _temp_dir) = create_test_scheduler_with_repo(4);
+
+        let task = test_task("test-spawn");
+        let task_id = task.id;
+        {
+            let mut dag = dag.write().await;
+            dag.add_task(task.clone());
+        }
+
+        // When spawn_task() is called
+        let agent_id = scheduler.spawn_task(&task).await.unwrap();
+
+        // Then worktree is created
+        let worktree_path = Scheduler::worktree_path_for_task(&task_id);
+        assert!(worktree_path.exists(), "Worktree should exist at {:?}", worktree_path);
+
+        // And the agent_id should be valid
+        assert_ne!(agent_id, AgentId::default());
+
+        // Cleanup
+        if worktree_path.exists() {
+            let _ = std::fs::remove_dir_all(&worktree_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_creates_branch() {
+        // Given worktree is created
+        let (mut scheduler, dag, _, _, _, temp_dir) = create_test_scheduler_with_repo(4);
+
+        let task = test_task("test-branch");
+        let task_id = task.id;
+        {
+            let mut dag = dag.write().await;
+            dag.add_task(task.clone());
+        }
+
+        // When spawn_task is called
+        scheduler.spawn_task(&task).await.unwrap();
+
+        // Then branch zen/task/{task-id} exists
+        let branch_name = format!("zen/task/{}", task_id.short());
+        let output = std::process::Command::new("git")
+            .args(["branch", "--list", &branch_name])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        let branch_list = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            branch_list.contains(&branch_name),
+            "Branch {} should exist, got: {}",
+            branch_name,
+            branch_list
+        );
+
+        // Cleanup
+        let worktree_path = Scheduler::worktree_path_for_task(&task_id);
+        if worktree_path.exists() {
+            let _ = std::fs::remove_dir_all(&worktree_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_updates_task_worktree_path() {
+        // Given spawn completes
+        let (mut scheduler, dag, _, _, _, _temp_dir) = create_test_scheduler_with_repo(4);
+
+        let task = test_task("test-update");
+        let task_id = task.id;
+        {
+            let mut dag = dag.write().await;
+            dag.add_task(task.clone());
+        }
+
+        // When spawn_task returns
+        scheduler.spawn_task(&task).await.unwrap();
+
+        // Then task has worktree_path set
+        let dag = dag.read().await;
+        let updated_task = dag.get_task(&task_id).unwrap();
+        assert!(updated_task.worktree_path.is_some());
+        let worktree_path = updated_task.worktree_path.as_ref().unwrap();
+        assert!(worktree_path.exists());
+
+        // Cleanup
+        if worktree_path.exists() {
+            let _ = std::fs::remove_dir_all(worktree_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_updates_task_branch_name() {
+        // Given spawn completes
+        let (mut scheduler, dag, _, _, _, _temp_dir) = create_test_scheduler_with_repo(4);
+
+        let task = test_task("test-branch-name");
+        let task_id = task.id;
+        {
+            let mut dag = dag.write().await;
+            dag.add_task(task.clone());
+        }
+
+        // When spawn_task returns
+        scheduler.spawn_task(&task).await.unwrap();
+
+        // Then task has branch_name set
+        let dag = dag.read().await;
+        let updated_task = dag.get_task(&task_id).unwrap();
+        assert!(updated_task.branch_name.is_some());
+        let branch_name = updated_task.branch_name.as_ref().unwrap();
+        assert!(branch_name.starts_with("zen/task/"));
+
+        // Cleanup
+        let worktree_path = Scheduler::worktree_path_for_task(&task_id);
+        if worktree_path.exists() {
+            let _ = std::fs::remove_dir_all(&worktree_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_respects_pool_capacity() {
+        // Given pool at capacity
+        let (mut scheduler, dag, _, _, _, _temp_dir) = create_test_scheduler_with_repo(1);
+
+        let task1 = test_task("task-1");
+        let task2 = test_task("task-2");
+        {
+            let mut dag = dag.write().await;
+            dag.add_task(task1.clone());
+            dag.add_task(task2.clone());
+        }
+
+        // First spawn succeeds
+        scheduler.spawn_task(&task1).await.unwrap();
+
+        // Second spawn should fail due to capacity
+        let result = scheduler.spawn_task(&task2).await;
+        assert!(result.is_err());
+
+        // Cleanup
+        let worktree_path = Scheduler::worktree_path_for_task(&task1.id);
+        if worktree_path.exists() {
+            let _ = std::fs::remove_dir_all(&worktree_path);
+        }
+    }
+
+    #[test]
+    fn test_worktree_path_for_task() {
+        let task_id = TaskId::new();
+        let path = Scheduler::worktree_path_for_task(&task_id);
+
+        // Should be under ~/.zen/worktrees/
+        assert!(path.to_string_lossy().contains(".zen"));
+        assert!(path.to_string_lossy().contains("worktrees"));
+        assert!(path.to_string_lossy().contains(&task_id.short()));
+    }
+
+    #[test]
+    fn test_worktree_path_uses_short_task_id() {
+        let task_id = TaskId::new();
+        let path = Scheduler::worktree_path_for_task(&task_id);
+
+        // Path should contain the short task ID, not the full UUID
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains(&task_id.short()));
+        // Full UUID is 36 chars, short is 8, so path shouldn't be too long
+        assert!(!path_str.contains(&task_id.to_string()));
+    }
+
+    // ========== Progress Tracking Tests ==========
+
+    #[test]
+    fn test_scheduler_event_task_progress() {
+        let event = SchedulerEvent::TaskProgress {
+            completed: 3,
+            total: 5,
+        };
+
+        if let SchedulerEvent::TaskProgress { completed, total } = event {
+            assert_eq!(completed, 3);
+            assert_eq!(total, 5);
+        } else {
+            panic!("Expected TaskProgress variant");
+        }
+    }
+
+    #[test]
+    fn test_scheduler_event_task_progress_equality() {
+        let e1 = SchedulerEvent::TaskProgress {
+            completed: 3,
+            total: 5,
+        };
+        let e2 = SchedulerEvent::TaskProgress {
+            completed: 3,
+            total: 5,
+        };
+        assert_eq!(e1, e2);
+
+        let e3 = SchedulerEvent::TaskProgress {
+            completed: 2,
+            total: 5,
+        };
+        assert_ne!(e1, e3);
+    }
+
+    #[tokio::test]
+    async fn test_progress_percentage_empty_dag() {
+        let (scheduler, _, _, _, _) = create_test_scheduler(4);
+
+        // Empty DAG should return 100% (nothing to do = complete)
+        let progress = scheduler.progress_percentage().await;
+        assert_eq!(progress, 100);
+    }
+
+    #[tokio::test]
+    async fn test_progress_percentage_no_completed() {
+        let (scheduler, dag, _, _, _) = create_test_scheduler(4);
+
+        // Add tasks but don't complete any
+        {
+            let mut dag = dag.write().await;
+            dag.add_task(test_task("task-a"));
+            dag.add_task(test_task("task-b"));
+            dag.add_task(test_task("task-c"));
+        }
+
+        // 0/3 = 0%
+        let progress = scheduler.progress_percentage().await;
+        assert_eq!(progress, 0);
+    }
+
+    #[tokio::test]
+    async fn test_progress_percentage_3_of_5() {
+        // Acceptance criteria: 3 of 5 tasks complete = 60%
+        let (mut scheduler, dag, _, mut event_rx, _) = create_test_scheduler(4);
+
+        // Add 5 tasks
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+        let task_c = test_task("task-c");
+        let task_d = test_task("task-d");
+        let task_e = test_task("task-e");
+
+        {
+            let mut dag = dag.write().await;
+            dag.add_task(task_a.clone());
+            dag.add_task(task_b.clone());
+            dag.add_task(task_c.clone());
+            dag.add_task(task_d.clone());
+            dag.add_task(task_e.clone());
+        }
+
+        // Dispatch all 5
+        scheduler.dispatch_ready_tasks().await.unwrap();
+
+        // Collect agent IDs
+        let mut agent_ids = Vec::new();
+        for _ in 0..5 {
+            if let SchedulerEvent::TaskStarted { agent_id, .. } = event_rx.recv().await.unwrap() {
+                agent_ids.push(agent_id);
+            }
+        }
+
+        // Complete 3 tasks
+        for agent_id in agent_ids.iter().take(3) {
+            scheduler
+                .handle_completion(*agent_id, "commit".to_string())
+                .await
+                .unwrap();
+        }
+
+        // 3/5 = 60%
+        let progress = scheduler.progress_percentage().await;
+        assert_eq!(progress, 60);
+    }
+
+    #[tokio::test]
+    async fn test_progress_percentage_all_complete() {
+        let (mut scheduler, dag, _, mut event_rx, _) = create_test_scheduler(4);
+
+        // Add 2 tasks
+        let task_a = test_task("task-a");
+        let task_b = test_task("task-b");
+
+        {
+            let mut dag = dag.write().await;
+            dag.add_task(task_a.clone());
+            dag.add_task(task_b.clone());
+        }
+
+        scheduler.dispatch_ready_tasks().await.unwrap();
+
+        // Get agent IDs
+        let agent_a = match event_rx.recv().await.unwrap() {
+            SchedulerEvent::TaskStarted { agent_id, .. } => agent_id,
+            _ => panic!("Expected TaskStarted"),
+        };
+        let agent_b = match event_rx.recv().await.unwrap() {
+            SchedulerEvent::TaskStarted { agent_id, .. } => agent_id,
+            _ => panic!("Expected TaskStarted"),
+        };
+
+        // Complete both
+        scheduler
+            .handle_completion(agent_a, "commit-a".to_string())
+            .await
+            .unwrap();
+        scheduler
+            .handle_completion(agent_b, "commit-b".to_string())
+            .await
+            .unwrap();
+
+        // 2/2 = 100%
+        let progress = scheduler.progress_percentage().await;
+        assert_eq!(progress, 100);
+    }
+
+    #[tokio::test]
+    async fn test_total_tasks() {
+        let (scheduler, dag, _, _, _) = create_test_scheduler(4);
+
+        // Empty DAG
+        assert_eq!(scheduler.total_tasks().await, 0);
+
+        // Add tasks
+        {
+            let mut dag = dag.write().await;
+            dag.add_task(test_task("task-a"));
+            dag.add_task(test_task("task-b"));
+            dag.add_task(test_task("task-c"));
+        }
+
+        assert_eq!(scheduler.total_tasks().await, 3);
+    }
+
+    #[tokio::test]
+    async fn test_completed_count() {
+        let (mut scheduler, dag, _, mut event_rx, _) = create_test_scheduler(4);
+
+        // Initial count is 0
+        assert_eq!(scheduler.completed_count(), 0);
+
+        // Add and dispatch a task
+        let task = test_task("task-a");
+        {
+            let mut dag = dag.write().await;
+            dag.add_task(task.clone());
+        }
+        scheduler.dispatch_ready_tasks().await.unwrap();
+
+        let agent_id = match event_rx.recv().await.unwrap() {
+            SchedulerEvent::TaskStarted { agent_id, .. } => agent_id,
+            _ => panic!("Expected TaskStarted"),
+        };
+
+        // Still 0 (not yet complete)
+        assert_eq!(scheduler.completed_count(), 0);
+
+        // Complete the task
+        scheduler
+            .handle_completion(agent_id, "commit".to_string())
+            .await
+            .unwrap();
+
+        // Now 1
+        assert_eq!(scheduler.completed_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_emit_progress_event_on_completion() {
+        let (mut scheduler, dag, _, mut event_rx, _) = create_test_scheduler(4);
+
+        // Add 3 tasks
+        {
+            let mut dag = dag.write().await;
+            dag.add_task(test_task("task-a"));
+            dag.add_task(test_task("task-b"));
+            dag.add_task(test_task("task-c"));
+        }
+
+        scheduler.dispatch_ready_tasks().await.unwrap();
+
+        // Collect agent IDs from TaskStarted events
+        let mut agent_ids = Vec::new();
+        for _ in 0..3 {
+            if let SchedulerEvent::TaskStarted { agent_id, .. } = event_rx.recv().await.unwrap() {
+                agent_ids.push(agent_id);
+            }
+        }
+
+        // Complete the first task
+        scheduler
+            .handle_completion(agent_ids[0], "commit".to_string())
+            .await
+            .unwrap();
+
+        // Drain events and look for TaskProgress
+        // First should be TaskCompleted
+        let mut found_progress = false;
+        for _ in 0..3 {
+            match event_rx.try_recv() {
+                Ok(SchedulerEvent::TaskProgress { completed, total }) => {
+                    assert_eq!(completed, 1);
+                    assert_eq!(total, 3);
+                    found_progress = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(found_progress, "Should emit TaskProgress event on completion");
+    }
+
+    #[tokio::test]
+    async fn test_with_state_manager_builder() {
+        let temp_dir = TempDir::new().unwrap();
+        // Initialize git repo
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(temp_dir.path().join("README.md"), "# Test").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+
+        let state_manager = GitStateManager::new(temp_dir.path()).unwrap();
+
+        let dag = Arc::new(RwLock::new(TaskDAG::new()));
+        let (pool_tx, _pool_rx) = mpsc::channel(100);
+        let pool = Arc::new(RwLock::new(AgentPool::new(4, pool_tx)));
+        let (event_tx, _event_rx) = mpsc::channel(100);
+
+        let scheduler = Scheduler::new(
+            Arc::clone(&dag),
+            Arc::clone(&pool),
+            event_tx,
+            temp_dir.path().to_path_buf(),
+        )
+        .with_state_manager(state_manager);
+
+        // Verify state_manager is set (it's private, so we test indirectly)
+        assert!(scheduler.state_manager.is_some());
     }
 }
