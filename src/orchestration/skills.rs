@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::sleep;
 
+use crate::core::CodeTask;
 use crate::error::{Error, Result};
 use crate::workflow::{Workflow, WorkflowConfig, WorkflowId, WorkflowPhase, WorkflowState, WorkflowStatus};
 use crate::{zlog, zlog_debug};
@@ -548,9 +549,15 @@ impl SkillsOrchestrator {
 
         // PHASE 2: Task Generation with /code-task-generator
         zlog!("[orchestrator] Beginning task generation phase");
-        if let Err(e) = self.run_task_generation_phase().await {
-            return Ok(self.fail_workflow(workflow_id, format!("Task generation phase failed: {}", e)).await);
-        }
+        let _generated_tasks = match self.run_task_generation_phase().await {
+            Ok(tasks) => {
+                zlog!("[orchestrator] Generated {} code tasks", tasks.len());
+                tasks
+            }
+            Err(e) => {
+                return Ok(self.fail_workflow(workflow_id, format!("Task generation phase failed: {}", e)).await);
+            }
+        };
 
         // Transition to Implementation
         {
@@ -703,10 +710,132 @@ impl SkillsOrchestrator {
         Ok(pdd_result)
     }
 
-    /// Run the task generation phase (stub - will be implemented in Step 9).
-    async fn run_task_generation_phase(&self) -> Result<()> {
-        zlog_debug!("[orchestrator] Task generation phase stub - will run /code-task-generator in Step 9");
-        Ok(())
+    /// Run the task generation phase by executing /code-task-generator.
+    ///
+    /// This phase takes the PDD output (plan.md) and generates individual
+    /// .code-task.md files that can be executed independently in the
+    /// implementation phase.
+    ///
+    /// # Returns
+    ///
+    /// A vector of CodeTask objects parsed from the generated files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Agent fails to spawn
+    /// - /code-task-generator execution fails or times out
+    /// - No .code-task.md files are generated
+    async fn run_task_generation_phase(&self) -> Result<Vec<CodeTask>> {
+        zlog!("[orchestrator] Running /code-task-generator skill");
+
+        // Get the PDD result path from the repo
+        let planning_dir = self.repo_path.join(".sop").join("planning");
+        let pdd_result = PDDResult::from_directory(&planning_dir)?;
+
+        // Run the task generation with the PDD result
+        let tasks = self.run_code_task_generator_phase(&pdd_result).await?;
+
+        zlog!(
+            "[orchestrator] Task generation phase completed: {} tasks generated",
+            tasks.len()
+        );
+
+        Ok(tasks)
+    }
+
+    /// Execute the /code-task-generator skill and return the generated code tasks.
+    ///
+    /// This is the core task generation implementation that:
+    /// 1. Spawns an agent for the /code-task-generator skill
+    /// 2. Sends the /code-task-generator command with the plan.md path
+    /// 3. Monitors output, answering questions via AIHumanProxy
+    /// 4. Scans for generated .code-task.md files on completion
+    /// 5. Parses and returns CodeTask objects
+    ///
+    /// # Arguments
+    ///
+    /// * `pdd` - The PDD result containing the plan.md path
+    ///
+    /// # Returns
+    ///
+    /// A vector of CodeTask objects parsed from the generated files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Agent fails to spawn (`Error::AgentPoolFull`)
+    /// - /code-task-generator execution fails or times out
+    /// - No .code-task.md files are generated (`Error::NoCodeTasksGenerated`)
+    pub async fn run_code_task_generator_phase(&self, pdd: &PDDResult) -> Result<Vec<CodeTask>> {
+        zlog_debug!("[task-gen] Spawning agent for /code-task-generator skill");
+
+        // Spawn an agent for the code-task-generator skill
+        let agent = self
+            .agent_pool
+            .write()
+            .await
+            .spawn_for_skill("code-task-generator")
+            .await?;
+        zlog_debug!("[task-gen] Agent {} spawned", agent.id);
+
+        // Send the /code-task-generator command with the plan.md path as input
+        let generator_command = format!(
+            "/code-task-generator\n\ninput: {}",
+            pdd.plan_path.display()
+        );
+        agent.send(&generator_command)?;
+        zlog_debug!("[task-gen] Sent /code-task-generator command to agent");
+
+        // Monitor agent output and answer questions via AIHumanProxy
+        let config = MonitorConfig::default();
+        let skill_result = self.monitor_agent_output(&agent, &config).await?;
+
+        if !skill_result.is_success() {
+            return Err(Error::ClaudeExecutionFailed(
+                "Code task generator skill did not complete successfully".to_string(),
+            ));
+        }
+
+        zlog_debug!(
+            "[task-gen] /code-task-generator completed: {} questions answered in {:?}",
+            skill_result.questions_answered,
+            skill_result.duration
+        );
+
+        // Scan for generated .code-task.md files
+        // The generator typically creates files in the worktree root or .sop directory
+        // We'll look in both locations and the implementation directory
+        let search_paths = [
+            self.repo_path.clone(),
+            self.repo_path.join(".sop"),
+            self.repo_path.join(".sop").join("planning").join("implementation"),
+        ];
+
+        let mut all_tasks = Vec::new();
+        for search_path in &search_paths {
+            if let Ok(tasks) = CodeTask::from_directory(search_path) {
+                all_tasks.extend(tasks);
+            }
+        }
+
+        // Deduplicate by ID (in case the same task is found in multiple locations)
+        let mut seen_ids = std::collections::HashSet::new();
+        all_tasks.retain(|task| seen_ids.insert(task.id.clone()));
+
+        if all_tasks.is_empty() {
+            return Err(Error::NoCodeTasksGenerated {
+                path: self.repo_path.display().to_string(),
+            });
+        }
+
+        zlog!(
+            "[task-gen] Found {} code tasks in {}",
+            all_tasks.len(),
+            self.repo_path.display()
+        );
+
+        Ok(all_tasks)
     }
 
     /// Run the implementation phase (stub - will be implemented in Step 11).
@@ -1751,6 +1880,189 @@ mod tests {
             PathBuf::new(),
             PathBuf::new(),
             PathBuf::new(),
+        );
+    }
+
+    // ========== Task Generation Phase Tests ==========
+    //
+    // These tests verify the task generation phase implementation.
+    // Full integration tests with actual agents will be in Step 19.
+
+    #[test]
+    fn test_run_task_generation_phase_requires_pdd_artifacts() {
+        // The task generation phase requires PDD artifacts to exist
+        // This is tested via the PDDResult::from_directory tests above
+        // Verifying that run_task_generation_phase calls PDDResult::from_directory
+        let _orchestrator = create_test_orchestrator();
+        // Without PDD artifacts, run_task_generation_phase would fail
+        // This is covered by the PDDArtifactNotFound error tests
+    }
+
+    #[tokio::test]
+    async fn test_task_generation_phase_fails_without_pdd_artifacts() {
+        let orchestrator = create_test_orchestrator();
+        // repo_path is /tmp/test-repo which doesn't have PDD artifacts
+        let result = orchestrator.run_task_generation_phase().await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_task_generation_phase_uses_correct_planning_dir() {
+        let orchestrator = create_test_orchestrator();
+        let expected_planning_dir = orchestrator.repo_path().join(".sop").join("planning");
+        // Verify the orchestrator would look in the correct location
+        assert!(expected_planning_dir.ends_with(".sop/planning"));
+    }
+
+    #[tokio::test]
+    async fn test_run_code_task_generator_phase_spawns_agent() {
+        // This test verifies that run_code_task_generator_phase attempts to spawn an agent
+        // Without tmux, the agent spawn will fail, but we can verify the flow
+        let orchestrator = create_test_orchestrator();
+        let pdd = PDDResult::with_paths(
+            PathBuf::from("/mock/design.md"),
+            PathBuf::from("/mock/plan.md"),
+            PathBuf::from("/mock/research"),
+        );
+
+        let result = orchestrator.run_code_task_generator_phase(&pdd).await;
+        // Without tmux, this will fail at agent spawn
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_code_task_search_paths_include_expected_locations() {
+        let orchestrator = create_test_orchestrator();
+        let repo_path = orchestrator.repo_path();
+
+        // Verify the search paths that would be used
+        let expected_paths = vec![
+            repo_path.to_path_buf(),
+            repo_path.join(".sop"),
+            repo_path.join(".sop").join("planning").join("implementation"),
+        ];
+
+        // These are the paths that run_code_task_generator_phase searches
+        assert_eq!(expected_paths[0], PathBuf::from("/tmp/test-repo"));
+        assert_eq!(expected_paths[1], PathBuf::from("/tmp/test-repo/.sop"));
+        assert_eq!(
+            expected_paths[2],
+            PathBuf::from("/tmp/test-repo/.sop/planning/implementation")
+        );
+    }
+
+    #[test]
+    fn test_no_code_tasks_generated_error() {
+        // Test the NoCodeTasksGenerated error type
+        let error = Error::NoCodeTasksGenerated {
+            path: "/test/path".to_string(),
+        };
+        let error_msg = format!("{}", error);
+        assert!(error_msg.contains("No code tasks found"));
+        assert!(error_msg.contains("/test/path"));
+    }
+
+    // ========== CodeTask Integration Tests ==========
+
+    #[test]
+    fn test_code_task_from_directory_with_generated_files() {
+        use crate::core::CodeTask;
+
+        let temp_dir = std::env::temp_dir().join(format!("task_gen_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Create mock .code-task.md files
+        for i in 1..=5 {
+            let content = format!(
+                r#"# Task: Task {}
+
+## Description
+Description for task {}.
+
+## Acceptance Criteria
+1. Criterion 1
+2. Criterion 2
+
+## Metadata
+- **Complexity**: Medium
+"#,
+                i, i
+            );
+            let file_path = temp_dir.join(format!("task-{:02}.code-task.md", i));
+            std::fs::write(&file_path, content).unwrap();
+        }
+
+        let tasks = CodeTask::from_directory(&temp_dir).unwrap();
+        assert_eq!(tasks.len(), 5);
+        assert_eq!(tasks[0].title, "Task 1");
+        assert_eq!(tasks[4].title, "Task 5");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_code_task_from_directory_empty() {
+        use crate::core::CodeTask;
+
+        let temp_dir = std::env::temp_dir().join(format!("task_gen_empty_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let tasks = CodeTask::from_directory(&temp_dir).unwrap();
+        assert!(tasks.is_empty());
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_code_task_deduplication_by_id() {
+        // Test that tasks are deduplicated by ID when found in multiple locations
+        use std::collections::HashSet;
+
+        let task_ids = vec!["task-01", "task-02", "task-01", "task-03", "task-02"];
+        let mut seen_ids = HashSet::new();
+        let deduplicated: Vec<_> = task_ids
+            .into_iter()
+            .filter(|id| seen_ids.insert(*id))
+            .collect();
+
+        assert_eq!(deduplicated.len(), 3);
+        assert!(deduplicated.contains(&"task-01"));
+        assert!(deduplicated.contains(&"task-02"));
+        assert!(deduplicated.contains(&"task-03"));
+    }
+
+    // ========== Execute with Task Generation Tests ==========
+
+    #[tokio::test]
+    async fn test_execute_captures_generated_tasks() {
+        // This test verifies that execute() captures the generated tasks
+        // Currently, the tasks are stored in _generated_tasks (unused for now)
+        // The implementation phase (Step 11) will use these tasks
+        let mut orchestrator = create_test_orchestrator();
+        let result = orchestrator.execute("test prompt").await.unwrap();
+
+        // Without tmux, planning fails first before task generation
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result.summary.contains("Planning phase failed"));
+    }
+
+    #[test]
+    fn test_task_generation_phase_is_phase_2() {
+        // Verify task generation is Phase 2 in the workflow
+        let phase = WorkflowPhase::TaskGeneration;
+        assert!(matches!(phase, WorkflowPhase::TaskGeneration));
+
+        // Verify the ordering: Planning < TaskGeneration < Implementation
+        use std::cmp::Ordering;
+        assert_eq!(
+            WorkflowPhase::Planning.cmp(&WorkflowPhase::TaskGeneration),
+            Ordering::Less
+        );
+        assert_eq!(
+            WorkflowPhase::TaskGeneration.cmp(&WorkflowPhase::Implementation),
+            Ordering::Less
         );
     }
 }

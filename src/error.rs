@@ -64,6 +64,9 @@ pub enum Error {
 
     #[error("PDD artifact not found: {path}")]
     PDDArtifactNotFound { path: String },
+
+    #[error("No code tasks found after task generation in {path}")]
+    NoCodeTasksGenerated { path: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
