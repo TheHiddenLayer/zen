@@ -9,6 +9,6 @@ mod ai_human;
 mod claude;
 mod pool;
 
-pub use ai_human::{AIHumanProxy, ConversationContext};
-pub use claude::{ClaudeHeadless, ClaudeResponse, ResultType, DEFAULT_TIMEOUT_SECS};
+pub use ai_human::{AIHumanProxy, ClaudeBackendConfig, ConversationContext};
+pub use claude::{ClaudeHeadless, ClaudeResponse, ResultType, SessionManager, DEFAULT_TIMEOUT_SECS};
 pub use pool::{AgentEvent, AgentHandle, AgentOutput, AgentPool};

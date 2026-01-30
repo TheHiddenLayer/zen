@@ -4,8 +4,17 @@
 //! the user, enabling fully autonomous workflow execution. It uses the
 //! original user intent and accumulated conversation context to generate
 //! reasonable responses.
+//!
+//! ## Real vs Mock Responses
+//!
+//! The proxy supports two modes:
+//! - **Mock mode** (default): Returns pattern-based responses for testing
+//! - **Real mode**: Uses Claude headless to generate contextual responses
+//!
+//! To enable real mode, use `AIHumanProxy::with_claude()`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 /// Tracks conversation context for consistent AI-as-Human responses.
@@ -158,11 +167,30 @@ impl ConversationContext {
     }
 }
 
+/// Configuration for real Claude backend in AIHumanProxy.
+///
+/// When configured, the proxy will use Claude headless to generate
+/// contextual responses instead of mock pattern matching.
+#[derive(Debug, Clone)]
+pub struct ClaudeBackendConfig {
+    /// Path to the Claude binary.
+    pub binary: PathBuf,
+    /// Working directory for Claude execution.
+    pub cwd: PathBuf,
+    /// Session ID for continuation (if any).
+    pub session_id: Option<String>,
+}
+
 /// AI-as-Human proxy for answering skill clarification questions.
 ///
 /// Skills like /pdd ask clarifying questions one at a time. Instead of
 /// requiring human interaction, the AIHumanProxy answers these questions
 /// based on the original user intent and accumulated context.
+///
+/// # Modes
+///
+/// - **Mock mode** (default): Returns pattern-based responses for testing
+/// - **Real mode**: Uses Claude headless to generate contextual responses
 ///
 /// # Example
 ///
@@ -180,6 +208,8 @@ pub struct AIHumanProxy {
     context: Arc<RwLock<ConversationContext>>,
     /// Model to use for generating answers (e.g., "haiku" for fast responses).
     model: String,
+    /// Optional Claude backend configuration for real responses.
+    claude_config: Option<ClaudeBackendConfig>,
 }
 
 impl AIHumanProxy {
@@ -190,7 +220,8 @@ impl AIHumanProxy {
     ///
     /// The proxy stores the original prompt to use as context when
     /// answering questions. It uses the "haiku" model by default
-    /// for fast responses.
+    /// for fast responses. By default, this creates a mock proxy
+    /// that returns pattern-based responses.
     ///
     /// # Arguments
     ///
@@ -208,6 +239,67 @@ impl AIHumanProxy {
             original_prompt: prompt.to_string(),
             context: Arc::new(RwLock::new(ConversationContext::new())),
             model: Self::DEFAULT_MODEL.to_string(),
+            claude_config: None,
+        }
+    }
+
+    /// Create an AI-as-Human proxy with real Claude backend.
+    ///
+    /// When configured with a Claude backend, the proxy will use
+    /// Claude headless to generate contextual responses instead
+    /// of mock pattern matching.
+    ///
+    /// # Arguments
+    ///
+    /// * `prompt` - The original user request/intent
+    /// * `config` - Claude backend configuration
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use zen::orchestration::{AIHumanProxy, ClaudeBackendConfig};
+    /// use std::path::PathBuf;
+    ///
+    /// let config = ClaudeBackendConfig {
+    ///     binary: PathBuf::from("/usr/local/bin/claude"),
+    ///     cwd: PathBuf::from("."),
+    ///     session_id: None,
+    /// };
+    /// let proxy = AIHumanProxy::with_claude("build authentication", config);
+    /// ```
+    pub fn with_claude(prompt: &str, config: ClaudeBackendConfig) -> Self {
+        Self {
+            original_prompt: prompt.to_string(),
+            context: Arc::new(RwLock::new(ConversationContext::new())),
+            model: Self::DEFAULT_MODEL.to_string(),
+            claude_config: Some(config),
+        }
+    }
+
+    /// Check if the proxy is configured with a real Claude backend.
+    pub fn has_claude_backend(&self) -> bool {
+        self.claude_config.is_some()
+    }
+
+    /// Get the Claude backend configuration, if any.
+    pub fn claude_config(&self) -> Option<&ClaudeBackendConfig> {
+        self.claude_config.as_ref()
+    }
+
+    /// Update the session ID for Claude continuation.
+    ///
+    /// This should be called after each Claude interaction to enable
+    /// session continuation for the next question.
+    pub fn set_session_id(&mut self, session_id: String) {
+        if let Some(ref mut config) = self.claude_config {
+            config.session_id = Some(session_id);
+        }
+    }
+
+    /// Clear the session ID (e.g., when a workflow completes).
+    pub fn clear_session(&mut self) {
+        if let Some(ref mut config) = self.claude_config {
+            config.session_id = None;
         }
     }
 
@@ -722,5 +814,150 @@ mod tests {
         let proxy = AIHumanProxy::new("build auth");
         // Should match because it contains the pattern
         assert!(proxy.needs_escalation("I know you have a personal preference for this"));
+    }
+
+    // ClaudeBackendConfig tests
+
+    #[test]
+    fn test_claude_backend_config_debug() {
+        let config = ClaudeBackendConfig {
+            binary: PathBuf::from("/usr/local/bin/claude"),
+            cwd: PathBuf::from("."),
+            session_id: Some("session_123".to_string()),
+        };
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("ClaudeBackendConfig"));
+        assert!(debug.contains("session_123"));
+    }
+
+    #[test]
+    fn test_claude_backend_config_clone() {
+        let config = ClaudeBackendConfig {
+            binary: PathBuf::from("/usr/local/bin/claude"),
+            cwd: PathBuf::from("."),
+            session_id: Some("session_123".to_string()),
+        };
+        let cloned = config.clone();
+        assert_eq!(config.binary, cloned.binary);
+        assert_eq!(config.session_id, cloned.session_id);
+    }
+
+    // AIHumanProxy Claude backend tests
+
+    #[test]
+    fn test_ai_human_proxy_no_claude_backend_by_default() {
+        let proxy = AIHumanProxy::new("build auth");
+        assert!(!proxy.has_claude_backend());
+        assert!(proxy.claude_config().is_none());
+    }
+
+    #[test]
+    fn test_ai_human_proxy_with_claude() {
+        let config = ClaudeBackendConfig {
+            binary: PathBuf::from("/usr/local/bin/claude"),
+            cwd: PathBuf::from("/project"),
+            session_id: None,
+        };
+        let proxy = AIHumanProxy::with_claude("build auth", config);
+        assert!(proxy.has_claude_backend());
+        assert!(proxy.claude_config().is_some());
+    }
+
+    #[test]
+    fn test_ai_human_proxy_claude_config_values() {
+        let config = ClaudeBackendConfig {
+            binary: PathBuf::from("/path/to/claude"),
+            cwd: PathBuf::from("/work/dir"),
+            session_id: Some("existing_session".to_string()),
+        };
+        let proxy = AIHumanProxy::with_claude("build auth", config);
+
+        let retrieved = proxy.claude_config().unwrap();
+        assert_eq!(retrieved.binary, PathBuf::from("/path/to/claude"));
+        assert_eq!(retrieved.cwd, PathBuf::from("/work/dir"));
+        assert_eq!(
+            retrieved.session_id,
+            Some("existing_session".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ai_human_proxy_set_session_id() {
+        let config = ClaudeBackendConfig {
+            binary: PathBuf::from("/path/to/claude"),
+            cwd: PathBuf::from("."),
+            session_id: None,
+        };
+        let mut proxy = AIHumanProxy::with_claude("build auth", config);
+
+        // Initially no session
+        assert!(proxy.claude_config().unwrap().session_id.is_none());
+
+        // Set session ID
+        proxy.set_session_id("new_session_123".to_string());
+        assert_eq!(
+            proxy.claude_config().unwrap().session_id,
+            Some("new_session_123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ai_human_proxy_set_session_id_no_effect_without_backend() {
+        let mut proxy = AIHumanProxy::new("build auth");
+        // Should not panic, just no-op
+        proxy.set_session_id("session_123".to_string());
+        assert!(!proxy.has_claude_backend());
+    }
+
+    #[test]
+    fn test_ai_human_proxy_clear_session() {
+        let config = ClaudeBackendConfig {
+            binary: PathBuf::from("/path/to/claude"),
+            cwd: PathBuf::from("."),
+            session_id: Some("existing_session".to_string()),
+        };
+        let mut proxy = AIHumanProxy::with_claude("build auth", config);
+
+        // Verify session exists
+        assert!(proxy.claude_config().unwrap().session_id.is_some());
+
+        // Clear session
+        proxy.clear_session();
+        assert!(proxy.claude_config().unwrap().session_id.is_none());
+    }
+
+    #[test]
+    fn test_ai_human_proxy_clear_session_no_effect_without_backend() {
+        let mut proxy = AIHumanProxy::new("build auth");
+        // Should not panic, just no-op
+        proxy.clear_session();
+        assert!(!proxy.has_claude_backend());
+    }
+
+    #[test]
+    fn test_ai_human_proxy_with_claude_preserves_other_fields() {
+        let config = ClaudeBackendConfig {
+            binary: PathBuf::from("/path/to/claude"),
+            cwd: PathBuf::from("."),
+            session_id: None,
+        };
+        let proxy = AIHumanProxy::with_claude("my special prompt", config);
+
+        assert_eq!(proxy.original_prompt(), "my special prompt");
+        assert_eq!(proxy.model(), "haiku");
+    }
+
+    #[test]
+    fn test_ai_human_proxy_with_claude_is_cloneable() {
+        let config = ClaudeBackendConfig {
+            binary: PathBuf::from("/path/to/claude"),
+            cwd: PathBuf::from("."),
+            session_id: Some("session_123".to_string()),
+        };
+        let proxy = AIHumanProxy::with_claude("build auth", config);
+        let cloned = proxy.clone();
+
+        assert_eq!(proxy.original_prompt(), cloned.original_prompt());
+        assert!(cloned.has_claude_backend());
     }
 }

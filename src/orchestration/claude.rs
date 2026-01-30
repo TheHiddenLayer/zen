@@ -1,12 +1,21 @@
-//! Claude Code headless executor.
+//! Claude Code headless executor with session continuation.
 //!
 //! The `ClaudeHeadless` struct provides programmatic execution of Claude Code
 //! in headless mode (`-p` flag) with JSON output parsing. This enables
 //! autonomous interaction with Claude for skill execution.
+//!
+//! ## Session Continuation
+//!
+//! Claude Code maintains conversation context via session IDs. By using the
+//! `--resume` flag with a session ID, subsequent calls can continue previous
+//! conversations. The `SessionManager` tracks active sessions for multi-turn
+//! conversations.
 
 use crate::error::{Error, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -87,6 +96,108 @@ struct RawClaudeResponse {
     num_turns: Option<u32>,
     #[serde(default)]
     error: Option<String>,
+}
+
+/// Tracks active Claude sessions for multi-turn conversations.
+///
+/// The `SessionManager` maintains a mapping of workflow/task identifiers to
+/// their associated Claude session IDs, enabling conversation continuation
+/// across multiple interactions.
+///
+/// # Example
+///
+/// ```
+/// use zen::orchestration::SessionManager;
+///
+/// let manager = SessionManager::new();
+/// manager.register("workflow_1", "session_abc123");
+/// assert_eq!(manager.get("workflow_1"), Some("session_abc123".to_string()));
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct SessionManager {
+    /// Maps workflow/task identifiers to session IDs.
+    sessions: Arc<RwLock<HashMap<String, String>>>,
+}
+
+impl SessionManager {
+    /// Create a new empty session manager.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a session ID for a workflow/task identifier.
+    ///
+    /// # Arguments
+    ///
+    /// * `identifier` - The workflow or task identifier
+    /// * `session_id` - The Claude session ID to associate
+    pub fn register(&self, identifier: &str, session_id: &str) {
+        if let Ok(mut sessions) = self.sessions.write() {
+            sessions.insert(identifier.to_string(), session_id.to_string());
+        }
+    }
+
+    /// Get the session ID for a workflow/task identifier.
+    ///
+    /// # Arguments
+    ///
+    /// * `identifier` - The workflow or task identifier to look up
+    ///
+    /// # Returns
+    ///
+    /// The associated session ID if found, or `None` if not registered.
+    pub fn get(&self, identifier: &str) -> Option<String> {
+        self.sessions
+            .read()
+            .ok()
+            .and_then(|sessions| sessions.get(identifier).cloned())
+    }
+
+    /// Remove a session registration.
+    ///
+    /// # Arguments
+    ///
+    /// * `identifier` - The workflow or task identifier to remove
+    ///
+    /// # Returns
+    ///
+    /// The removed session ID if it existed.
+    pub fn remove(&self, identifier: &str) -> Option<String> {
+        self.sessions
+            .write()
+            .ok()
+            .and_then(|mut sessions| sessions.remove(identifier))
+    }
+
+    /// Clear all session registrations.
+    ///
+    /// Useful for cleanup when a workflow completes or is cancelled.
+    pub fn clear(&self) {
+        if let Ok(mut sessions) = self.sessions.write() {
+            sessions.clear();
+        }
+    }
+
+    /// Get the number of registered sessions.
+    pub fn len(&self) -> usize {
+        self.sessions
+            .read()
+            .map(|sessions| sessions.len())
+            .unwrap_or(0)
+    }
+
+    /// Check if there are no registered sessions.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Get all registered session identifiers.
+    pub fn identifiers(&self) -> Vec<String> {
+        self.sessions
+            .read()
+            .map(|sessions| sessions.keys().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Claude Code headless executor.
@@ -232,6 +343,249 @@ impl ClaudeHeadless {
         // Non-JSON success output (shouldn't happen with --output-format json)
         Ok(ClaudeResponse {
             session_id: None,
+            result: ResultType::Success {
+                output: stdout.trim().to_string(),
+            },
+            cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+        })
+    }
+
+    /// Continue an existing Claude session with a new prompt.
+    ///
+    /// Uses the `--resume` flag to continue a previous conversation,
+    /// maintaining the context from earlier interactions.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session ID from a previous execution
+    /// * `prompt` - The new prompt to send
+    /// * `cwd` - The working directory for execution
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The command fails to spawn
+    /// - The command times out
+    /// - The session cannot be resumed (e.g., invalid session ID)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // First execution
+    /// let response1 = claude.execute("Explain this code", Path::new(".")).await?;
+    /// let session_id = response1.session_id.expect("Should have session ID");
+    ///
+    /// // Continue the conversation
+    /// let response2 = claude.continue_session(&session_id, "What about error handling?", Path::new(".")).await?;
+    /// ```
+    pub async fn continue_session(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        cwd: &Path,
+    ) -> Result<ClaudeResponse> {
+        let output = tokio::time::timeout(
+            self.timeout,
+            Command::new(&self.binary)
+                .arg("--resume")
+                .arg(session_id)
+                .arg("-p")
+                .arg(prompt)
+                .arg("--output-format")
+                .arg(&self.output_format)
+                .current_dir(cwd)
+                .output(),
+        )
+        .await
+        .map_err(|_| Error::Timeout(self.timeout))?
+        .map_err(Error::Io)?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Try to parse JSON response
+        if let Ok(response) = Self::parse_json_response(&stdout) {
+            return Ok(response);
+        }
+
+        // If JSON parsing failed, check exit code
+        if !output.status.success() {
+            let error_msg = if stderr.is_empty() {
+                format!(
+                    "Claude session continuation failed with exit code {}",
+                    output.status.code().unwrap_or(-1)
+                )
+            } else {
+                stderr.trim().to_string()
+            };
+
+            return Ok(ClaudeResponse {
+                session_id: Some(session_id.to_string()),
+                result: ResultType::Error { message: error_msg },
+                cost_usd: None,
+                duration_ms: None,
+                num_turns: None,
+            });
+        }
+
+        // Non-JSON success output
+        Ok(ClaudeResponse {
+            session_id: Some(session_id.to_string()),
+            result: ResultType::Success {
+                output: stdout.trim().to_string(),
+            },
+            cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+        })
+    }
+
+    /// Execute a prompt with a specific model.
+    ///
+    /// Uses the `--model` flag to select a specific Claude model
+    /// for execution. Useful for fast responses with lighter models
+    /// like haiku.
+    ///
+    /// # Arguments
+    ///
+    /// * `prompt` - The prompt to send to Claude
+    /// * `cwd` - The working directory for execution
+    /// * `model` - The model to use (e.g., "haiku", "sonnet", "opus")
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if execution fails.
+    pub async fn execute_with_model(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        model: &str,
+    ) -> Result<ClaudeResponse> {
+        let output = tokio::time::timeout(
+            self.timeout,
+            Command::new(&self.binary)
+                .arg("-p")
+                .arg(prompt)
+                .arg("--model")
+                .arg(model)
+                .arg("--output-format")
+                .arg(&self.output_format)
+                .current_dir(cwd)
+                .output(),
+        )
+        .await
+        .map_err(|_| Error::Timeout(self.timeout))?
+        .map_err(Error::Io)?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Try to parse JSON response
+        if let Ok(response) = Self::parse_json_response(&stdout) {
+            return Ok(response);
+        }
+
+        // If JSON parsing failed, check exit code
+        if !output.status.success() {
+            let error_msg = if stderr.is_empty() {
+                format!(
+                    "Claude execution failed with exit code {}",
+                    output.status.code().unwrap_or(-1)
+                )
+            } else {
+                stderr.trim().to_string()
+            };
+
+            return Ok(ClaudeResponse {
+                session_id: None,
+                result: ResultType::Error { message: error_msg },
+                cost_usd: None,
+                duration_ms: None,
+                num_turns: None,
+            });
+        }
+
+        // Non-JSON success output
+        Ok(ClaudeResponse {
+            session_id: None,
+            result: ResultType::Success {
+                output: stdout.trim().to_string(),
+            },
+            cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+        })
+    }
+
+    /// Continue a session with a specific model.
+    ///
+    /// Combines session continuation with model selection, useful for
+    /// multi-turn conversations with specific model requirements.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session ID from a previous execution
+    /// * `prompt` - The new prompt to send
+    /// * `cwd` - The working directory for execution
+    /// * `model` - The model to use
+    pub async fn continue_session_with_model(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        cwd: &Path,
+        model: &str,
+    ) -> Result<ClaudeResponse> {
+        let output = tokio::time::timeout(
+            self.timeout,
+            Command::new(&self.binary)
+                .arg("--resume")
+                .arg(session_id)
+                .arg("-p")
+                .arg(prompt)
+                .arg("--model")
+                .arg(model)
+                .arg("--output-format")
+                .arg(&self.output_format)
+                .current_dir(cwd)
+                .output(),
+        )
+        .await
+        .map_err(|_| Error::Timeout(self.timeout))?
+        .map_err(Error::Io)?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Try to parse JSON response
+        if let Ok(response) = Self::parse_json_response(&stdout) {
+            return Ok(response);
+        }
+
+        // If JSON parsing failed, check exit code
+        if !output.status.success() {
+            let error_msg = if stderr.is_empty() {
+                format!(
+                    "Claude session continuation failed with exit code {}",
+                    output.status.code().unwrap_or(-1)
+                )
+            } else {
+                stderr.trim().to_string()
+            };
+
+            return Ok(ClaudeResponse {
+                session_id: Some(session_id.to_string()),
+                result: ResultType::Error { message: error_msg },
+                cost_usd: None,
+                duration_ms: None,
+                num_turns: None,
+            });
+        }
+
+        // Non-JSON success output
+        Ok(ClaudeResponse {
+            session_id: Some(session_id.to_string()),
             result: ResultType::Success {
                 output: stdout.trim().to_string(),
             },
@@ -706,5 +1060,199 @@ mod tests {
         // Either timeout or error is acceptable here
         // (timeout if sleep somehow runs, error if it rejects args)
         assert!(result.is_ok() || result.is_err());
+    }
+
+    // ========== SessionManager Tests ==========
+
+    #[test]
+    fn test_session_manager_new() {
+        let manager = SessionManager::new();
+        assert!(manager.is_empty());
+        assert_eq!(manager.len(), 0);
+    }
+
+    #[test]
+    fn test_session_manager_default() {
+        let manager = SessionManager::default();
+        assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn test_session_manager_register_and_get() {
+        let manager = SessionManager::new();
+        manager.register("workflow_1", "session_abc123");
+
+        assert_eq!(
+            manager.get("workflow_1"),
+            Some("session_abc123".to_string())
+        );
+        assert!(!manager.is_empty());
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_session_manager_get_nonexistent() {
+        let manager = SessionManager::new();
+        assert_eq!(manager.get("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_session_manager_register_multiple() {
+        let manager = SessionManager::new();
+        manager.register("workflow_1", "session_1");
+        manager.register("workflow_2", "session_2");
+        manager.register("task_3", "session_3");
+
+        assert_eq!(manager.len(), 3);
+        assert_eq!(manager.get("workflow_1"), Some("session_1".to_string()));
+        assert_eq!(manager.get("workflow_2"), Some("session_2".to_string()));
+        assert_eq!(manager.get("task_3"), Some("session_3".to_string()));
+    }
+
+    #[test]
+    fn test_session_manager_register_overwrite() {
+        let manager = SessionManager::new();
+        manager.register("workflow_1", "old_session");
+        manager.register("workflow_1", "new_session");
+
+        assert_eq!(manager.len(), 1);
+        assert_eq!(manager.get("workflow_1"), Some("new_session".to_string()));
+    }
+
+    #[test]
+    fn test_session_manager_remove() {
+        let manager = SessionManager::new();
+        manager.register("workflow_1", "session_1");
+        manager.register("workflow_2", "session_2");
+
+        let removed = manager.remove("workflow_1");
+        assert_eq!(removed, Some("session_1".to_string()));
+        assert_eq!(manager.len(), 1);
+        assert_eq!(manager.get("workflow_1"), None);
+        assert_eq!(manager.get("workflow_2"), Some("session_2".to_string()));
+    }
+
+    #[test]
+    fn test_session_manager_remove_nonexistent() {
+        let manager = SessionManager::new();
+        let removed = manager.remove("nonexistent");
+        assert_eq!(removed, None);
+    }
+
+    #[test]
+    fn test_session_manager_clear() {
+        let manager = SessionManager::new();
+        manager.register("workflow_1", "session_1");
+        manager.register("workflow_2", "session_2");
+
+        manager.clear();
+        assert!(manager.is_empty());
+        assert_eq!(manager.len(), 0);
+    }
+
+    #[test]
+    fn test_session_manager_identifiers() {
+        let manager = SessionManager::new();
+        manager.register("workflow_1", "session_1");
+        manager.register("task_2", "session_2");
+
+        let identifiers = manager.identifiers();
+        assert_eq!(identifiers.len(), 2);
+        assert!(identifiers.contains(&"workflow_1".to_string()));
+        assert!(identifiers.contains(&"task_2".to_string()));
+    }
+
+    #[test]
+    fn test_session_manager_identifiers_empty() {
+        let manager = SessionManager::new();
+        assert!(manager.identifiers().is_empty());
+    }
+
+    #[test]
+    fn test_session_manager_clone() {
+        let manager = SessionManager::new();
+        manager.register("workflow_1", "session_1");
+
+        let cloned = manager.clone();
+        // Cloned manager shares the same Arc, so they see the same data
+        assert_eq!(cloned.get("workflow_1"), Some("session_1".to_string()));
+
+        // Adding to original is visible in clone (they share the Arc)
+        manager.register("workflow_2", "session_2");
+        assert_eq!(cloned.get("workflow_2"), Some("session_2".to_string()));
+    }
+
+    #[test]
+    fn test_session_manager_debug() {
+        let manager = SessionManager::new();
+        manager.register("workflow_1", "session_1");
+        let debug = format!("{:?}", manager);
+        assert!(debug.contains("SessionManager"));
+    }
+
+    // ========== Continue Session Tests (Integration) ==========
+
+    #[tokio::test]
+    async fn test_continue_session_with_nonexistent_binary() {
+        let claude = ClaudeHeadless::with_binary(PathBuf::from("/nonexistent/binary"));
+        let result = claude
+            .continue_session("session_abc", "continue", Path::new("."))
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires claude binary"]
+    async fn test_continue_session_integration() {
+        let claude = ClaudeHeadless::new().expect("Claude binary should exist");
+
+        // First, execute a prompt to get a session ID
+        let response1 = claude
+            .execute("Remember the number 42", Path::new("."))
+            .await
+            .expect("First execution should succeed");
+
+        let session_id = response1.session_id.expect("Should have session ID");
+
+        // Continue the session
+        let response2 = claude
+            .continue_session(&session_id, "What number did I ask you to remember?", Path::new("."))
+            .await
+            .expect("Continue session should succeed");
+
+        assert!(response2.is_success());
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_model_nonexistent_binary() {
+        let claude = ClaudeHeadless::with_binary(PathBuf::from("/nonexistent/binary"));
+        let result = claude
+            .execute_with_model("test", Path::new("."), "haiku")
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires claude binary"]
+    async fn test_execute_with_model_haiku() {
+        let claude = ClaudeHeadless::new().expect("Claude binary should exist");
+        let response = claude
+            .execute_with_model("Say hello", Path::new("."), "haiku")
+            .await
+            .expect("Should succeed with haiku model");
+
+        assert!(response.is_success());
+    }
+
+    #[tokio::test]
+    async fn test_continue_session_with_model_nonexistent_binary() {
+        let claude = ClaudeHeadless::with_binary(PathBuf::from("/nonexistent/binary"));
+        let result = claude
+            .continue_session_with_model("session_abc", "continue", Path::new("."), "haiku")
+            .await;
+
+        assert!(result.is_err());
     }
 }

@@ -1,0 +1,90 @@
+# Progress Log
+
+## Step 1: Core Workflow Models and Types
+
+### Task 1.1: Create Workflow Core Types - COMPLETED
+- **Commit:** 3ccce13
+- **Files:** src/workflow/mod.rs, src/workflow/types.rs, src/lib.rs
+- **Tests:** 27 tests passing (`cargo test workflow`)
+- **Summary:** Added WorkflowId (UUID-based), WorkflowPhase (6 variants with ordering), WorkflowStatus (5 variants with default)
+
+### Task 1.2: Create Workflow and WorkflowConfig Structs - COMPLETED
+- **Commit:** 386fe78
+- **Files:** src/workflow/mod.rs, src/workflow/types.rs
+- **Tests:** 44 workflow tests passing, 199 total tests passing
+- **Summary:** Added WorkflowConfig (update_docs, max_parallel_agents, staging_branch_prefix with defaults), TaskId placeholder type, Workflow struct with lifecycle methods (new, start, complete, fail)
+
+### Task 1.3: Implement WorkflowState with Phase Transitions - COMPLETED
+- **Commit:** b9e1a37
+- **Files:** src/workflow/state.rs, src/workflow/mod.rs, src/error.rs
+- **Tests:** 77 workflow tests passing, 232 total tests passing
+- **Summary:** Added WorkflowState struct with phase transition validation (Planning->TaskGeneration->Implementation->Merging->Documentation/Complete), PhaseHistoryEntry for tracking, InvalidPhaseTransition error variant. Documentation phase is optional.
+
+## Step 2: Git State Manager Migration
+
+### Task 2.1: Create GitStateManager Structure - COMPLETED
+- **Commit:** 612a008
+- **Files:** src/state/mod.rs, src/state/manager.rs, src/lib.rs
+- **Tests:** 7 state tests passing, 239 total tests passing
+- **Summary:** Added GitStateManager struct that composes GitRefs, GitNotes, and GitOps to provide a unified interface for git-native state persistence. Includes constructor with repo validation and accessor methods for all three components.
+
+### Task 2.2: Implement Workflow Persistence via Git Notes - COMPLETED
+- **Commit:** 6e0635e
+- **Files:** src/state/manager.rs
+- **Tests:** 16 state tests passing, 248 total tests passing
+- **Summary:** Added workflow persistence methods to GitStateManager: save_workflow, load_workflow, list_workflows, delete_workflow. Each workflow stored as JSON note under refs/notes/zen/workflows/{id} namespace with corresponding ref at refs/zen/workflows/{id}. Per-workflow namespace prevents collision when multiple workflows share the same commit.
+
+### Task 2.3: Create State Migration Tool - COMPLETED
+- **Commit:** bcdd5ac
+- **Files:** src/state/migration.rs, src/state/mod.rs
+- **Tests:** 10 migration tests passing, 258 total tests passing
+- **Summary:** Added migration module with methods to transition existing Zen installations from JSON state to git-native storage. Key methods: needs_migration(), migrate(), migrate_if_needed(), is_migrated(), migration_marker_commit(). Creates marker ref at refs/zen/migrated to track completion. Migration is idempotent and backward compatible - sessions continue using JSON while workflows use git-native storage.
+
+## Step 3: AI-as-Human Proxy Foundation
+
+### Task 3.1: Create AIHumanProxy Core Structure - COMPLETED
+- **Commit:** 7d73f05
+- **Files:** src/orchestration/mod.rs, src/orchestration/ai_human.rs, src/lib.rs
+- **Tests:** 29 orchestration tests passing, 287 total tests passing (+3 doc tests)
+- **Summary:** Added AIHumanProxy struct that autonomously answers skill clarification questions on behalf of the user. Includes ConversationContext for Q&A history tracking, mock answer generation based on question patterns (database, yes/no, name, etc.), and escalation detection for preference-based questions. Uses Arc<RwLock<ConversationContext>> for thread-safe context sharing.
+
+### Task 3.2: Implement ConversationContext Tracking - COMPLETED
+- **Commit:** 3f03a84
+- **Files:** src/orchestration/ai_human.rs
+- **Tests:** 47 orchestration tests passing, 305 total tests passing (+6 doc tests)
+- **Summary:** Enhanced ConversationContext with decisions HashMap for tracking key decisions extracted from Q&A pairs. Implemented decision extraction heuristics in record() method for naming, database, technology, and architecture decisions. Added decisions() accessor method. Added 18 new tests for decision extraction covering all acceptance criteria.
+
+## Step 4: Agent Pool Enhancements
+
+### Task 4.1: Add AgentId and AgentStatus Types - COMPLETED
+- **Commit:** 421ef61
+- **Files:** src/agent.rs
+- **Tests:** 24 agent tests passing, 325 total tests passing (+6 doc tests)
+- **Summary:** Added AgentId (UUID-based newtype following SessionId/WorkflowId pattern) with new(), short(), Default, Display, FromStr, and Serialize/Deserialize. Added AgentStatus enum with 5 variants: Idle, Running { task_id }, Stuck { since, reason }, Failed { error }, Terminated. Implemented Default (Idle) and Display for AgentStatus. Note: Stuck variant uses Instant which cannot be serialized - documented for future handling.
+
+### Task 4.2: Create AgentPool for Multi-Agent Management - COMPLETED
+- **Commit:** 80335aa
+- **Files:** src/orchestration/pool.rs, src/orchestration/mod.rs, src/error.rs
+- **Tests:** 34 pool tests passing, 359 total tests passing (+6 doc tests)
+- **Summary:** Added AgentPool struct that manages multiple concurrent agents with capacity limits and event emission via tokio mpsc channel. Includes AgentEvent enum (Started, Completed, Failed, StuckDetected, Terminated), AgentHandle placeholder struct with id/status/task_id fields, and AgentPool methods (new, spawn stub, terminate, get, active_count, has_capacity, max_concurrent). Added AgentPoolFull and AgentNotFound error variants. Full spawning implementation deferred to Task 4.3.
+
+### Task 4.3: Implement AgentHandle for Agent Communication - COMPLETED
+- **Commit:** 48f38c9
+- **Files:** src/orchestration/pool.rs, src/orchestration/mod.rs
+- **Tests:** 70 pool tests passing, 395 total tests passing (+6 doc tests)
+- **Summary:** Implemented full AgentHandle with tmux session communication. Added AgentOutput enum (Text, Question, Completed, Error) with pattern-based parsing for detecting questions, completion markers, and errors. Enhanced AgentHandle with new fields (tmux_session, worktree_path, started_at, last_activity, cancel_token) and communication methods (send, read_output, read_raw_output, read_output_tail, last_commit). Added activity tracking (touch_activity, idle_duration, running_duration) and cancellation support.
+
+## Step 5: Claude Code Headless Integration
+
+### Task 5.1: Create ClaudeHeadless Executor - COMPLETED
+- **Commit:** e88c1dd
+- **Files:** src/orchestration/claude.rs, src/orchestration/mod.rs, src/error.rs
+- **Tests:** 33 claude tests passing, 427 total tests passing (+6 doc tests)
+- **Summary:** Added ClaudeHeadless struct that executes Claude Code in headless mode (-p flag) with JSON output parsing. Includes ResultType enum (Success/Error), ClaudeResponse struct with session_id/result/cost/duration fields, binary detection via `which` crate, async execution with tokio::process::Command, and configurable timeout (default 10 minutes). Added ClaudeBinaryNotFound and ClaudeExecutionFailed error variants.
+
+### Task 5.2: Implement Claude Session Continuation - COMPLETED
+- **Commit:** d32569f
+- **Files:** src/orchestration/claude.rs, src/orchestration/ai_human.rs, src/orchestration/mod.rs
+- **Tests:** 59 claude tests passing, 176 orchestration tests passing, 454 total tests passing (+7 doc tests)
+- **Summary:** Added session continuation support to ClaudeHeadless with continue_session() and continue_session_with_model() methods using --resume flag. Created SessionManager for tracking active sessions with register/get/remove/clear operations. Enhanced AIHumanProxy with optional Claude backend via ClaudeBackendConfig struct, supporting real Claude responses instead of mock patterns. Added set_session_id() and clear_session() methods for session lifecycle management. Full test coverage for SessionManager operations and AIHumanProxy Claude backend configuration.
+
