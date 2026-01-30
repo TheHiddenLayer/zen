@@ -46,6 +46,9 @@ pub enum Error {
 
     #[error("Ref not found: {0}")]
     RefNotFound(String),
+
+    #[error("Invalid phase transition from {from} to {to}")]
+    InvalidPhaseTransition { from: String, to: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
