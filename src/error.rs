@@ -55,6 +55,12 @@ pub enum Error {
 
     #[error("Agent not found: {id}")]
     AgentNotFound { id: crate::agent::AgentId },
+
+    #[error("Claude binary not found in PATH")]
+    ClaudeBinaryNotFound,
+
+    #[error("Claude execution failed: {0}")]
+    ClaudeExecutionFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
