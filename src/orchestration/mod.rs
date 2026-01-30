@@ -3,16 +3,19 @@
 //! This module provides components for coordinating multiple AI agents,
 //! including the AI-as-Human proxy that autonomously answers skill
 //! clarification questions, the Claude headless executor for
-//! programmatic interaction with Claude Code, and the central
-//! SkillsOrchestrator that drives the workflow phases.
+//! programmatic interaction with Claude Code, the central
+//! SkillsOrchestrator that drives the workflow phases, and the
+//! Scheduler for parallel task execution.
 
 mod ai_human;
 mod claude;
 pub mod detection;
 mod pool;
+mod scheduler;
 mod skills;
 
 pub use ai_human::{AIHumanProxy, ClaudeBackendConfig, ConversationContext};
 pub use claude::{ClaudeHeadless, ClaudeResponse, ResultType, SessionManager, DEFAULT_TIMEOUT_SECS};
 pub use pool::{AgentEvent, AgentHandle, AgentOutput, AgentPool};
+pub use scheduler::{ImplResult, Scheduler, SchedulerEvent};
 pub use skills::{MonitorConfig, PDDResult, PhaseController, PhaseEvent, SkillResult, SkillsOrchestrator, WorkflowResult};
