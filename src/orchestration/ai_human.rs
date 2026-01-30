@@ -5,17 +5,40 @@
 //! original user intent and accumulated conversation context to generate
 //! reasonable responses.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// Tracks conversation context for consistent AI-as-Human responses.
 ///
 /// This struct accumulates question-answer pairs and extracted decisions
-/// to maintain consistency across the conversation. The full implementation
-/// is in Task 3.2; this provides the minimal interface needed by AIHumanProxy.
-#[derive(Debug, Default, Clone)]
+/// to maintain consistency across the conversation. When recording Q&A pairs,
+/// it automatically extracts key decisions (naming conventions, technology
+/// choices, architectural patterns) for future reference.
+///
+/// # Example
+///
+/// ```
+/// use zen::orchestration::ConversationContext;
+///
+/// let mut ctx = ConversationContext::new();
+/// ctx.record("What should we name the module?", "user_auth");
+/// assert_eq!(ctx.decisions().get("naming"), Some(&"user_auth".to_string()));
+/// ```
+#[derive(Debug, Clone)]
 pub struct ConversationContext {
     /// History of question-answer pairs.
     qa_history: Vec<(String, String)>,
+    /// Extracted key decisions for consistency.
+    decisions: HashMap<String, String>,
+}
+
+impl Default for ConversationContext {
+    fn default() -> Self {
+        Self {
+            qa_history: Vec::new(),
+            decisions: HashMap::new(),
+        }
+    }
 }
 
 impl ConversationContext {
@@ -25,8 +48,68 @@ impl ConversationContext {
     }
 
     /// Record a question and its answer for future reference.
+    ///
+    /// This method also extracts key decisions from the Q&A pair based on
+    /// question patterns. Recognized decision categories:
+    ///
+    /// - **naming**: Questions about names, naming conventions
+    /// - **database**: Questions about database choices
+    /// - **technology**: Questions about frameworks, libraries
+    /// - **architecture**: Questions about patterns, approaches, structure
+    ///
+    /// # Arguments
+    ///
+    /// * `question` - The question that was asked
+    /// * `answer` - The answer provided
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use zen::orchestration::ConversationContext;
+    ///
+    /// let mut ctx = ConversationContext::new();
+    /// ctx.record("Which database should we use?", "PostgreSQL");
+    /// assert_eq!(ctx.decisions().get("database"), Some(&"PostgreSQL".to_string()));
+    /// ```
     pub fn record(&mut self, question: &str, answer: &str) {
         self.qa_history.push((question.to_string(), answer.to_string()));
+
+        // Extract key decisions based on question patterns
+        let question_lower = question.to_lowercase();
+
+        // Naming decisions
+        if question_lower.contains("name")
+            || question_lower.contains("naming")
+            || question_lower.contains("call it")
+            || question_lower.contains("call the")
+        {
+            self.decisions.insert("naming".to_string(), answer.to_string());
+        }
+
+        // Database decisions
+        if question_lower.contains("database") || question_lower.contains("db") {
+            self.decisions.insert("database".to_string(), answer.to_string());
+        }
+
+        // Technology/library decisions
+        if question_lower.contains("framework")
+            || question_lower.contains("library")
+            || question_lower.contains("tool")
+            || question_lower.contains("technology")
+        {
+            self.decisions.insert("technology".to_string(), answer.to_string());
+        }
+
+        // Architecture decisions
+        if question_lower.contains("pattern")
+            || question_lower.contains("architecture")
+            || question_lower.contains("approach")
+            || question_lower.contains("structure")
+            || question_lower.contains("design")
+        {
+            self.decisions
+                .insert("architecture".to_string(), answer.to_string());
+        }
     }
 
     /// Generate a summary of the conversation context.
@@ -53,6 +136,25 @@ impl ConversationContext {
     /// Get the number of recorded Q&A pairs.
     pub fn len(&self) -> usize {
         self.qa_history.len()
+    }
+
+    /// Get the extracted decisions from the conversation.
+    ///
+    /// Returns a reference to the decisions HashMap containing key-value
+    /// pairs for recognized decision categories (naming, database,
+    /// technology, architecture).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use zen::orchestration::ConversationContext;
+    ///
+    /// let mut ctx = ConversationContext::new();
+    /// ctx.record("What pattern should we use?", "Repository pattern");
+    /// assert_eq!(ctx.decisions().get("architecture"), Some(&"Repository pattern".to_string()));
+    /// ```
+    pub fn decisions(&self) -> &HashMap<String, String> {
+        &self.decisions
     }
 }
 
@@ -263,6 +365,197 @@ mod tests {
         ctx.record("Q?", "A");
         let cloned = ctx.clone();
         assert_eq!(ctx.len(), cloned.len());
+    }
+
+    // Decision extraction tests
+
+    #[test]
+    fn test_decisions_empty_initially() {
+        let ctx = ConversationContext::new();
+        assert!(ctx.decisions().is_empty());
+    }
+
+    #[test]
+    fn test_decision_extraction_naming() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("What should we name the module?", "user_auth");
+        assert_eq!(
+            ctx.decisions().get("naming"),
+            Some(&"user_auth".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decision_extraction_naming_convention() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("What naming convention should we use?", "snake_case");
+        assert_eq!(
+            ctx.decisions().get("naming"),
+            Some(&"snake_case".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decision_extraction_call_it() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("What should we call it?", "AuthService");
+        assert_eq!(
+            ctx.decisions().get("naming"),
+            Some(&"AuthService".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decision_extraction_database() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("Which database should we use?", "PostgreSQL");
+        assert_eq!(
+            ctx.decisions().get("database"),
+            Some(&"PostgreSQL".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decision_extraction_db_shorthand() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("What db do you want?", "MySQL");
+        assert_eq!(ctx.decisions().get("database"), Some(&"MySQL".to_string()));
+    }
+
+    #[test]
+    fn test_decision_extraction_framework() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("Which framework should we use?", "Axum");
+        assert_eq!(
+            ctx.decisions().get("technology"),
+            Some(&"Axum".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decision_extraction_library() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("What library for JSON?", "serde_json");
+        assert_eq!(
+            ctx.decisions().get("technology"),
+            Some(&"serde_json".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decision_extraction_pattern() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("What pattern should we use?", "Repository pattern");
+        assert_eq!(
+            ctx.decisions().get("architecture"),
+            Some(&"Repository pattern".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decision_extraction_architecture() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("What architecture?", "Hexagonal");
+        assert_eq!(
+            ctx.decisions().get("architecture"),
+            Some(&"Hexagonal".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decision_extraction_approach() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("What approach should we take?", "TDD");
+        assert_eq!(ctx.decisions().get("architecture"), Some(&"TDD".to_string()));
+    }
+
+    #[test]
+    fn test_decision_extraction_design() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("What design do you prefer?", "Event-driven");
+        assert_eq!(
+            ctx.decisions().get("architecture"),
+            Some(&"Event-driven".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decision_extraction_multiple_decisions() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("What should we name it?", "user_service");
+        ctx.record("Which database?", "PostgreSQL");
+        ctx.record("What framework?", "Actix");
+        ctx.record("What pattern?", "MVC");
+
+        assert_eq!(
+            ctx.decisions().get("naming"),
+            Some(&"user_service".to_string())
+        );
+        assert_eq!(
+            ctx.decisions().get("database"),
+            Some(&"PostgreSQL".to_string())
+        );
+        assert_eq!(
+            ctx.decisions().get("technology"),
+            Some(&"Actix".to_string())
+        );
+        assert_eq!(ctx.decisions().get("architecture"), Some(&"MVC".to_string()));
+    }
+
+    #[test]
+    fn test_decision_extraction_override() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("What name?", "old_name");
+        ctx.record("What name should we use instead?", "new_name");
+        // Latest decision should override
+        assert_eq!(
+            ctx.decisions().get("naming"),
+            Some(&"new_name".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decision_extraction_case_insensitive() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("What DATABASE should we use?", "MongoDB");
+        assert_eq!(
+            ctx.decisions().get("database"),
+            Some(&"MongoDB".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_decision_for_unrelated_question() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("Should we add tests?", "yes");
+        assert!(ctx.decisions().get("naming").is_none());
+        assert!(ctx.decisions().get("database").is_none());
+        assert!(ctx.decisions().get("technology").is_none());
+        assert!(ctx.decisions().get("architecture").is_none());
+    }
+
+    #[test]
+    fn test_summary_with_three_qa_pairs() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("Q1?", "A1");
+        ctx.record("Q2?", "A2");
+        ctx.record("Q3?", "A3");
+        let summary = ctx.summary();
+        assert!(summary.contains("Q: Q1?"));
+        assert!(summary.contains("A: A1"));
+        assert!(summary.contains("Q: Q2?"));
+        assert!(summary.contains("A: A2"));
+        assert!(summary.contains("Q: Q3?"));
+        assert!(summary.contains("A: A3"));
+    }
+
+    #[test]
+    fn test_context_includes_previous_database_decision() {
+        let mut ctx = ConversationContext::new();
+        ctx.record("Which database?", "PostgreSQL");
+        // When a follow-up question is asked, summary includes the previous decision
+        let summary = ctx.summary();
+        assert!(summary.contains("PostgreSQL"));
     }
 
     // AIHumanProxy creation tests
