@@ -5,5 +5,7 @@
 //! clarification questions.
 
 mod ai_human;
+mod pool;
 
 pub use ai_human::{AIHumanProxy, ConversationContext};
+pub use pool::{AgentEvent, AgentHandle, AgentPool};

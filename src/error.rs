@@ -49,6 +49,12 @@ pub enum Error {
 
     #[error("Invalid phase transition from {from} to {to}")]
     InvalidPhaseTransition { from: String, to: String },
+
+    #[error("Agent pool is full (max: {max})")]
+    AgentPoolFull { max: usize },
+
+    #[error("Agent not found: {id}")]
+    AgentNotFound { id: crate::agent::AgentId },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
