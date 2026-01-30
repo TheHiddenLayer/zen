@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod config;
+pub mod core;
 pub mod error;
 pub mod git;
 pub mod git_notes;
