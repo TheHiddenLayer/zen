@@ -6,13 +6,184 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::workflow::{Workflow, WorkflowConfig, WorkflowId, WorkflowPhase, WorkflowState, WorkflowStatus};
 use crate::{zlog, zlog_debug};
 
 use super::{AgentEvent, AgentPool, AIHumanProxy, ClaudeHeadless};
+
+/// Events emitted by the PhaseController during phase transitions.
+///
+/// These events can be consumed by the TUI to show real-time progress updates.
+#[derive(Debug, Clone)]
+pub enum PhaseEvent {
+    /// A new phase has started.
+    Started {
+        /// The phase that started.
+        phase: WorkflowPhase,
+    },
+    /// Transitioned from one phase to another.
+    Changed {
+        /// The phase we transitioned from.
+        from: WorkflowPhase,
+        /// The phase we transitioned to.
+        to: WorkflowPhase,
+        /// How long we spent in the previous phase.
+        elapsed: Duration,
+    },
+    /// The entire workflow has completed.
+    Completed {
+        /// Total duration of all phases combined.
+        total_duration: Duration,
+    },
+}
+
+/// Controls workflow phase transitions and emits events for TUI updates.
+///
+/// The `PhaseController` centralizes phase management logic, validating
+/// transitions, tracking timing for each phase, and emitting events that
+/// the TUI can consume to show real-time progress.
+///
+/// # Example
+///
+/// ```ignore
+/// use tokio::sync::mpsc;
+/// use zen::orchestration::PhaseController;
+///
+/// let (tx, mut rx) = mpsc::channel(100);
+/// let mut controller = PhaseController::new(tx);
+///
+/// // Transition to next phase
+/// controller.transition(WorkflowPhase::TaskGeneration).await?;
+///
+/// // Receive event
+/// if let Some(event) = rx.recv().await {
+///     println!("Phase changed: {:?}", event);
+/// }
+/// ```
+pub struct PhaseController {
+    /// The current workflow phase.
+    current_phase: WorkflowPhase,
+    /// History of phases visited with timestamps.
+    phase_history: Vec<(WorkflowPhase, Instant)>,
+    /// Channel for emitting phase events.
+    event_tx: mpsc::Sender<PhaseEvent>,
+    /// When the controller was created (for total duration).
+    created_at: Instant,
+}
+
+impl PhaseController {
+    /// Create a new PhaseController.
+    ///
+    /// Starts in the Planning phase and emits a `PhaseEvent::Started` event.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_tx` - Channel sender for emitting phase events
+    pub fn new(event_tx: mpsc::Sender<PhaseEvent>) -> Self {
+        let now = Instant::now();
+        let initial_phase = WorkflowPhase::Planning;
+
+        // Emit initial started event (best effort, ignore if channel full)
+        let _ = event_tx.try_send(PhaseEvent::Started {
+            phase: initial_phase,
+        });
+
+        Self {
+            current_phase: initial_phase,
+            phase_history: vec![(initial_phase, now)],
+            event_tx,
+            created_at: now,
+        }
+    }
+
+    /// Get the current workflow phase.
+    pub fn current(&self) -> WorkflowPhase {
+        self.current_phase
+    }
+
+    /// Get the duration since the current phase started.
+    pub fn elapsed(&self) -> Duration {
+        if let Some((_, entered_at)) = self.phase_history.last() {
+            entered_at.elapsed()
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// Get the history of all phases visited.
+    ///
+    /// Returns a slice of (phase, timestamp) tuples in the order visited.
+    pub fn history(&self) -> &[(WorkflowPhase, Instant)] {
+        &self.phase_history
+    }
+
+    /// Attempt to transition to a new phase.
+    ///
+    /// Validates the transition according to the workflow rules:
+    /// - Planning -> TaskGeneration
+    /// - TaskGeneration -> Implementation
+    /// - Implementation -> Merging
+    /// - Merging -> Documentation OR Complete
+    /// - Documentation -> Complete
+    ///
+    /// On success, emits a `PhaseEvent::Changed` event. If transitioning to
+    /// `Complete`, also emits a `PhaseEvent::Completed` event.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidPhaseTransition` if the transition is not valid.
+    pub async fn transition(&mut self, target: WorkflowPhase) -> Result<()> {
+        // Validate transition
+        if !self.can_transition(target) {
+            return Err(Error::InvalidPhaseTransition {
+                from: self.current_phase.to_string(),
+                to: target.to_string(),
+            });
+        }
+
+        let from = self.current_phase;
+        let elapsed = self.elapsed();
+        let now = Instant::now();
+
+        // Update state
+        self.current_phase = target;
+        self.phase_history.push((target, now));
+
+        // Emit changed event
+        let _ = self.event_tx.send(PhaseEvent::Changed {
+            from,
+            to: target,
+            elapsed,
+        }).await;
+
+        // If completing, also emit completed event
+        if target == WorkflowPhase::Complete {
+            let total_duration = self.created_at.elapsed();
+            let _ = self.event_tx.send(PhaseEvent::Completed {
+                total_duration,
+            }).await;
+        }
+
+        Ok(())
+    }
+
+    /// Check if a transition to the target phase is valid.
+    fn can_transition(&self, target: WorkflowPhase) -> bool {
+        matches!(
+            (self.current_phase, target),
+            (WorkflowPhase::Planning, WorkflowPhase::TaskGeneration)
+                | (WorkflowPhase::TaskGeneration, WorkflowPhase::Implementation)
+                | (WorkflowPhase::Implementation, WorkflowPhase::Merging)
+                | (WorkflowPhase::Merging, WorkflowPhase::Documentation)
+                | (WorkflowPhase::Merging, WorkflowPhase::Complete)
+                | (WorkflowPhase::Documentation, WorkflowPhase::Complete)
+        )
+    }
+}
 
 /// Result of a workflow execution.
 ///
@@ -562,5 +733,447 @@ mod tests {
     fn test_skills_orchestrator_is_accessible() {
         // This test verifies SkillsOrchestrator can be constructed
         let _orchestrator = create_test_orchestrator();
+    }
+
+    // ========== PhaseEvent Tests ==========
+
+    #[test]
+    fn test_phase_event_started_debug() {
+        let event = PhaseEvent::Started {
+            phase: WorkflowPhase::Planning,
+        };
+        let debug = format!("{:?}", event);
+        assert!(debug.contains("Started"));
+        assert!(debug.contains("Planning"));
+    }
+
+    #[test]
+    fn test_phase_event_changed_debug() {
+        let event = PhaseEvent::Changed {
+            from: WorkflowPhase::Planning,
+            to: WorkflowPhase::TaskGeneration,
+            elapsed: Duration::from_secs(30),
+        };
+        let debug = format!("{:?}", event);
+        assert!(debug.contains("Changed"));
+        assert!(debug.contains("Planning"));
+        assert!(debug.contains("TaskGeneration"));
+    }
+
+    #[test]
+    fn test_phase_event_completed_debug() {
+        let event = PhaseEvent::Completed {
+            total_duration: Duration::from_secs(120),
+        };
+        let debug = format!("{:?}", event);
+        assert!(debug.contains("Completed"));
+    }
+
+    #[test]
+    fn test_phase_event_clone() {
+        let event = PhaseEvent::Changed {
+            from: WorkflowPhase::Planning,
+            to: WorkflowPhase::TaskGeneration,
+            elapsed: Duration::from_secs(10),
+        };
+        let cloned = event.clone();
+        match cloned {
+            PhaseEvent::Changed { from, to, elapsed } => {
+                assert_eq!(from, WorkflowPhase::Planning);
+                assert_eq!(to, WorkflowPhase::TaskGeneration);
+                assert_eq!(elapsed, Duration::from_secs(10));
+            }
+            _ => panic!("Expected Changed event"),
+        }
+    }
+
+    // ========== PhaseController Construction Tests ==========
+
+    #[test]
+    fn test_phase_controller_new() {
+        let (tx, _rx) = mpsc::channel(100);
+        let controller = PhaseController::new(tx);
+
+        assert_eq!(controller.current(), WorkflowPhase::Planning);
+    }
+
+    #[test]
+    fn test_phase_controller_initial_history() {
+        let (tx, _rx) = mpsc::channel(100);
+        let controller = PhaseController::new(tx);
+
+        let history = controller.history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0, WorkflowPhase::Planning);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_emits_started_event_on_creation() {
+        let (tx, mut rx) = mpsc::channel(100);
+        let _controller = PhaseController::new(tx);
+
+        // Should have received a Started event
+        let event = rx.try_recv();
+        assert!(event.is_ok());
+        match event.unwrap() {
+            PhaseEvent::Started { phase } => {
+                assert_eq!(phase, WorkflowPhase::Planning);
+            }
+            _ => panic!("Expected Started event"),
+        }
+    }
+
+    // ========== PhaseController current() Tests ==========
+
+    #[test]
+    fn test_phase_controller_current_returns_planning() {
+        let (tx, _rx) = mpsc::channel(100);
+        let controller = PhaseController::new(tx);
+        assert_eq!(controller.current(), WorkflowPhase::Planning);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_current_updates_after_transition() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        assert_eq!(controller.current(), WorkflowPhase::TaskGeneration);
+    }
+
+    // ========== PhaseController elapsed() Tests ==========
+
+    #[test]
+    fn test_phase_controller_elapsed_is_positive() {
+        let (tx, _rx) = mpsc::channel(100);
+        let controller = PhaseController::new(tx);
+
+        // Wait briefly
+        std::thread::sleep(Duration::from_millis(10));
+
+        let elapsed = controller.elapsed();
+        assert!(elapsed >= Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_elapsed_resets_on_transition() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        // Wait a bit in Planning phase
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Transition to TaskGeneration
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+
+        // Elapsed should be very small (just after transition)
+        let elapsed = controller.elapsed();
+        assert!(elapsed < Duration::from_millis(10));
+    }
+
+    // ========== PhaseController transition() Valid Transition Tests ==========
+
+    #[tokio::test]
+    async fn test_phase_controller_transition_planning_to_task_generation() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        let result = controller.transition(WorkflowPhase::TaskGeneration).await;
+        assert!(result.is_ok());
+        assert_eq!(controller.current(), WorkflowPhase::TaskGeneration);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_transition_task_generation_to_implementation() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        let result = controller.transition(WorkflowPhase::Implementation).await;
+
+        assert!(result.is_ok());
+        assert_eq!(controller.current(), WorkflowPhase::Implementation);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_transition_implementation_to_merging() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        controller.transition(WorkflowPhase::Implementation).await.unwrap();
+        let result = controller.transition(WorkflowPhase::Merging).await;
+
+        assert!(result.is_ok());
+        assert_eq!(controller.current(), WorkflowPhase::Merging);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_transition_merging_to_documentation() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        controller.transition(WorkflowPhase::Implementation).await.unwrap();
+        controller.transition(WorkflowPhase::Merging).await.unwrap();
+        let result = controller.transition(WorkflowPhase::Documentation).await;
+
+        assert!(result.is_ok());
+        assert_eq!(controller.current(), WorkflowPhase::Documentation);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_transition_merging_to_complete() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        controller.transition(WorkflowPhase::Implementation).await.unwrap();
+        controller.transition(WorkflowPhase::Merging).await.unwrap();
+        let result = controller.transition(WorkflowPhase::Complete).await;
+
+        assert!(result.is_ok());
+        assert_eq!(controller.current(), WorkflowPhase::Complete);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_transition_documentation_to_complete() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        controller.transition(WorkflowPhase::Implementation).await.unwrap();
+        controller.transition(WorkflowPhase::Merging).await.unwrap();
+        controller.transition(WorkflowPhase::Documentation).await.unwrap();
+        let result = controller.transition(WorkflowPhase::Complete).await;
+
+        assert!(result.is_ok());
+        assert_eq!(controller.current(), WorkflowPhase::Complete);
+    }
+
+    // ========== PhaseController transition() Invalid Transition Tests ==========
+
+    #[tokio::test]
+    async fn test_phase_controller_invalid_transition_planning_to_implementation() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        let result = controller.transition(WorkflowPhase::Implementation).await;
+
+        assert!(result.is_err());
+        assert_eq!(controller.current(), WorkflowPhase::Planning);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_invalid_transition_planning_to_merging() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        let result = controller.transition(WorkflowPhase::Merging).await;
+
+        assert!(result.is_err());
+        assert_eq!(controller.current(), WorkflowPhase::Planning);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_invalid_transition_planning_to_complete() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        let result = controller.transition(WorkflowPhase::Complete).await;
+
+        assert!(result.is_err());
+        assert_eq!(controller.current(), WorkflowPhase::Planning);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_invalid_same_phase_transition() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        let result = controller.transition(WorkflowPhase::Planning).await;
+
+        assert!(result.is_err());
+        assert_eq!(controller.current(), WorkflowPhase::Planning);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_invalid_backward_transition() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        let result = controller.transition(WorkflowPhase::Planning).await;
+
+        assert!(result.is_err());
+        assert_eq!(controller.current(), WorkflowPhase::TaskGeneration);
+    }
+
+    // ========== PhaseController Event Emission Tests ==========
+
+    #[tokio::test]
+    async fn test_phase_controller_emits_changed_event_on_transition() {
+        let (tx, mut rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        // Drain the Started event
+        let _ = rx.recv().await;
+
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+
+        let event = rx.recv().await.expect("Should receive Changed event");
+        match event {
+            PhaseEvent::Changed { from, to, .. } => {
+                assert_eq!(from, WorkflowPhase::Planning);
+                assert_eq!(to, WorkflowPhase::TaskGeneration);
+            }
+            _ => panic!("Expected Changed event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_emits_completed_event_on_final_transition() {
+        let (tx, mut rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        // Run through all transitions
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        controller.transition(WorkflowPhase::Implementation).await.unwrap();
+        controller.transition(WorkflowPhase::Merging).await.unwrap();
+        controller.transition(WorkflowPhase::Complete).await.unwrap();
+
+        // Collect all events
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // Should have: Started, Changed x4, Completed
+        assert!(events.len() >= 5);
+
+        // Last event should be Completed
+        let last = events.last().unwrap();
+        match last {
+            PhaseEvent::Completed { total_duration } => {
+                assert!(*total_duration > Duration::ZERO);
+            }
+            _ => panic!("Expected Completed event as last event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_changed_event_contains_elapsed_duration() {
+        let (tx, mut rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        // Drain the Started event
+        let _ = rx.recv().await;
+
+        // Wait a bit then transition
+        std::thread::sleep(Duration::from_millis(15));
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+
+        let event = rx.recv().await.expect("Should receive Changed event");
+        match event {
+            PhaseEvent::Changed { elapsed, .. } => {
+                // Should have been in Planning for at least 15ms
+                assert!(elapsed >= Duration::from_millis(15));
+            }
+            _ => panic!("Expected Changed event"),
+        }
+    }
+
+    // ========== PhaseController History Tracking Tests ==========
+
+    #[tokio::test]
+    async fn test_phase_controller_history_tracks_all_transitions() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        controller.transition(WorkflowPhase::Implementation).await.unwrap();
+        controller.transition(WorkflowPhase::Merging).await.unwrap();
+
+        let history = controller.history();
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0].0, WorkflowPhase::Planning);
+        assert_eq!(history[1].0, WorkflowPhase::TaskGeneration);
+        assert_eq!(history[2].0, WorkflowPhase::Implementation);
+        assert_eq!(history[3].0, WorkflowPhase::Merging);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_history_preserves_timestamp_order() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        controller.transition(WorkflowPhase::Implementation).await.unwrap();
+
+        let history = controller.history();
+
+        // Timestamps should be in increasing order
+        for i in 1..history.len() {
+            assert!(history[i].1 >= history[i - 1].1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_history_not_modified_on_invalid_transition() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        let initial_len = controller.history().len();
+
+        // Try invalid transition
+        let _ = controller.transition(WorkflowPhase::Merging).await;
+
+        assert_eq!(controller.history().len(), initial_len);
+    }
+
+    // ========== Full Workflow Traversal Tests ==========
+
+    #[tokio::test]
+    async fn test_phase_controller_full_workflow_with_documentation() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        controller.transition(WorkflowPhase::Implementation).await.unwrap();
+        controller.transition(WorkflowPhase::Merging).await.unwrap();
+        controller.transition(WorkflowPhase::Documentation).await.unwrap();
+        controller.transition(WorkflowPhase::Complete).await.unwrap();
+
+        assert_eq!(controller.current(), WorkflowPhase::Complete);
+        assert_eq!(controller.history().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_full_workflow_without_documentation() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        controller.transition(WorkflowPhase::Implementation).await.unwrap();
+        controller.transition(WorkflowPhase::Merging).await.unwrap();
+        controller.transition(WorkflowPhase::Complete).await.unwrap();
+
+        assert_eq!(controller.current(), WorkflowPhase::Complete);
+        assert_eq!(controller.history().len(), 5);
+    }
+
+    // ========== Module Export Tests for PhaseController ==========
+
+    #[test]
+    fn test_phase_controller_is_accessible() {
+        let (tx, _rx) = mpsc::channel::<PhaseEvent>(100);
+        let _controller = PhaseController::new(tx);
+    }
+
+    #[test]
+    fn test_phase_event_is_accessible() {
+        let _event = PhaseEvent::Started {
+            phase: WorkflowPhase::Planning,
+        };
     }
 }
