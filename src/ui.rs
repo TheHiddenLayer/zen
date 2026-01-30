@@ -15,18 +15,30 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Clear, Paragraph},
+    widgets::{Clear, Gauge, Paragraph},
     Frame,
 };
 
-use crate::render::{RenderState, SessionView};
+use crate::render::{RenderState, SessionView, WorkflowView};
 use crate::session::SessionStatus;
 use crate::tea::{InputKind, Mode, Notification, NotificationLevel};
+use crate::workflow::WorkflowStatus;
 
 // Color tokens (selection uses REVERSED modifier to adapt to terminal theme)
 const COLOR_TEXT_DIMMED: Color = Color::Gray;
 const COLOR_TEXT_MUTED: Color = Color::DarkGray;
 const COLOR_SEPARATOR: Color = Color::White;
+
+// Workflow status colors
+const COLOR_WORKFLOW_RUNNING: Color = Color::Green;
+const COLOR_WORKFLOW_COMPLETED: Color = Color::Cyan;
+const COLOR_WORKFLOW_FAILED: Color = Color::Red;
+const COLOR_WORKFLOW_PAUSED: Color = Color::Yellow;
+
+// Phase indicator colors
+const COLOR_PHASE_CURRENT: Color = Color::Cyan;
+const COLOR_PHASE_COMPLETED: Color = Color::Green;
+const COLOR_PHASE_PENDING: Color = Color::DarkGray;
 
 // Status color coding for faster visual parsing (uses terminal palette)
 const COLOR_STATUS_BUSY: Color = Color::Green;
@@ -610,6 +622,136 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Workflow UI Components
+// -----------------------------------------------------------------------------
+
+/// Render workflow header with name and status.
+///
+/// Displays the workflow name and current status when a workflow is active,
+/// or "No active workflow" message when no workflow is running.
+pub fn render_workflow_header(frame: &mut Frame, area: Rect, workflow: Option<&WorkflowView>) {
+    let line = match workflow {
+        Some(wf) => {
+            let status_color = workflow_status_color(&wf.status);
+            let status_label = workflow_status_label(&wf.status);
+
+            Line::from(vec![
+                Span::styled("Workflow: ", Style::default().fg(COLOR_TEXT_DIMMED)),
+                Span::styled(
+                    wf.name.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" [", Style::default().fg(COLOR_TEXT_MUTED)),
+                Span::styled(status_label, Style::default().fg(status_color)),
+                Span::styled("]", Style::default().fg(COLOR_TEXT_MUTED)),
+            ])
+        }
+        None => Line::from(Span::styled(
+            "No active workflow",
+            Style::default().fg(COLOR_TEXT_DIMMED),
+        )),
+    };
+
+    let paragraph = Paragraph::new(line);
+    frame.render_widget(paragraph, area);
+}
+
+/// Render phase progress indicator and progress bar.
+///
+/// Shows all 5 phases with the current phase highlighted, plus a progress bar
+/// showing overall completion percentage.
+pub fn render_phase_progress(frame: &mut Frame, area: Rect, workflow: Option<&WorkflowView>) {
+    let Some(wf) = workflow else {
+        // No workflow - render empty or placeholder
+        return;
+    };
+
+    // Need at least 2 lines: one for phases, one for progress bar
+    if area.height < 2 {
+        return;
+    }
+
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+
+    // Render phase indicator on first line
+    render_phase_indicator(frame, chunks[0], wf);
+
+    // Render progress bar on second line
+    render_progress_bar(frame, chunks[1], wf);
+}
+
+/// Render the 5-phase indicator with current phase highlighted.
+fn render_phase_indicator(frame: &mut Frame, area: Rect, workflow: &WorkflowView) {
+    let phase_names = WorkflowView::phase_names();
+    let current_idx = workflow.current_phase_index();
+
+    let mut spans: Vec<Span> = Vec::new();
+
+    for (i, name) in phase_names.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" → ", Style::default().fg(COLOR_TEXT_MUTED)));
+        }
+
+        let style = if i < current_idx {
+            // Completed phase
+            Style::default().fg(COLOR_PHASE_COMPLETED)
+        } else if i == current_idx && current_idx < 5 {
+            // Current phase (bold + highlighted)
+            Style::default()
+                .fg(COLOR_PHASE_CURRENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            // Pending phase
+            Style::default().fg(COLOR_PHASE_PENDING)
+        };
+
+        spans.push(Span::styled(*name, style));
+    }
+
+    let line = Line::from(spans);
+    let paragraph = Paragraph::new(line);
+    frame.render_widget(paragraph, area);
+}
+
+/// Render progress bar using Gauge widget.
+fn render_progress_bar(frame: &mut Frame, area: Rect, workflow: &WorkflowView) {
+    let percentage = workflow.progress_percentage();
+    let label = format!(
+        "{}% ({}/{})",
+        percentage, workflow.phase_progress.0, workflow.phase_progress.1
+    );
+
+    let gauge = Gauge::default()
+        .gauge_style(Style::default().fg(COLOR_PHASE_CURRENT).bg(Color::DarkGray))
+        .percent(percentage)
+        .label(label);
+
+    frame.render_widget(gauge, area);
+}
+
+/// Get color for workflow status.
+fn workflow_status_color(status: &WorkflowStatus) -> Color {
+    match status {
+        WorkflowStatus::Running => COLOR_WORKFLOW_RUNNING,
+        WorkflowStatus::Completed => COLOR_WORKFLOW_COMPLETED,
+        WorkflowStatus::Failed => COLOR_WORKFLOW_FAILED,
+        WorkflowStatus::Paused => COLOR_WORKFLOW_PAUSED,
+        WorkflowStatus::Pending => COLOR_TEXT_DIMMED,
+    }
+}
+
+/// Get display label for workflow status.
+fn workflow_status_label(status: &WorkflowStatus) -> &'static str {
+    match status {
+        WorkflowStatus::Running => "Running",
+        WorkflowStatus::Completed => "Completed",
+        WorkflowStatus::Failed => "Failed",
+        WorkflowStatus::Paused => "Paused",
+        WorkflowStatus::Pending => "Pending",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,5 +785,114 @@ mod tests {
             format_base_display("jsmith/dev", "c453da123456789"),
             "jsmith/dev @ c453da1"
         );
+    }
+
+    // Workflow UI Component tests
+
+    use crate::workflow::{WorkflowId, WorkflowPhase};
+
+    #[test]
+    fn test_workflow_status_color_running() {
+        assert_eq!(workflow_status_color(&WorkflowStatus::Running), COLOR_WORKFLOW_RUNNING);
+    }
+
+    #[test]
+    fn test_workflow_status_color_completed() {
+        assert_eq!(workflow_status_color(&WorkflowStatus::Completed), COLOR_WORKFLOW_COMPLETED);
+    }
+
+    #[test]
+    fn test_workflow_status_color_failed() {
+        assert_eq!(workflow_status_color(&WorkflowStatus::Failed), COLOR_WORKFLOW_FAILED);
+    }
+
+    #[test]
+    fn test_workflow_status_color_paused() {
+        assert_eq!(workflow_status_color(&WorkflowStatus::Paused), COLOR_WORKFLOW_PAUSED);
+    }
+
+    #[test]
+    fn test_workflow_status_color_pending() {
+        assert_eq!(workflow_status_color(&WorkflowStatus::Pending), COLOR_TEXT_DIMMED);
+    }
+
+    #[test]
+    fn test_workflow_status_label_all_statuses() {
+        assert_eq!(workflow_status_label(&WorkflowStatus::Running), "Running");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Completed), "Completed");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Failed), "Failed");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Paused), "Paused");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Pending), "Pending");
+    }
+
+    #[test]
+    fn test_workflow_view_for_implementation_phase() {
+        // Given workflow in Implementation phase
+        let view = WorkflowView::new(
+            WorkflowId::new(),
+            "build-auth".to_string(),
+            WorkflowPhase::Implementation,
+            WorkflowStatus::Running,
+        );
+
+        // Then current_phase_index returns 2 (Implementation is third phase)
+        assert_eq!(view.current_phase_index(), 2);
+
+        // And phase_progress shows 2 completed phases
+        assert_eq!(view.phase_progress, (2, 5));
+    }
+
+    #[test]
+    fn test_workflow_view_progress_bar_60_percent() {
+        // Given 3 of 5 phases complete (Merging phase)
+        let view = WorkflowView::new(
+            WorkflowId::new(),
+            "test".to_string(),
+            WorkflowPhase::Merging,
+            WorkflowStatus::Running,
+        );
+
+        // Then progress bar shows 60%
+        assert_eq!(view.progress_percentage(), 60);
+    }
+
+    #[test]
+    fn test_workflow_view_phase_names_ordered() {
+        let names = WorkflowView::phase_names();
+        // Verify phase names are in correct order
+        assert_eq!(names[0], "Planning");
+        assert_eq!(names[1], "TaskGen");
+        assert_eq!(names[2], "Impl");
+        assert_eq!(names[3], "Merge");
+        assert_eq!(names[4], "Docs");
+    }
+
+    #[test]
+    fn test_workflow_view_all_phase_indices() {
+        // Test that current_phase_index returns correct index for each phase
+        let test_cases = [
+            (WorkflowPhase::Planning, 0),
+            (WorkflowPhase::TaskGeneration, 1),
+            (WorkflowPhase::Implementation, 2),
+            (WorkflowPhase::Merging, 3),
+            (WorkflowPhase::Documentation, 4),
+            (WorkflowPhase::Complete, 5),
+        ];
+
+        for (phase, expected_idx) in test_cases {
+            let view = WorkflowView::new(
+                WorkflowId::new(),
+                "test".to_string(),
+                phase,
+                WorkflowStatus::Running,
+            );
+            assert_eq!(
+                view.current_phase_index(),
+                expected_idx,
+                "Phase {:?} should have index {}",
+                phase,
+                expected_idx
+            );
+        }
     }
 }

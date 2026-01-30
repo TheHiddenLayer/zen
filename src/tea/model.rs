@@ -203,6 +203,7 @@ impl Model {
             notification: self.notification.clone(),
             show_keymap: self.show_keymap,
             trust_enabled: self.config.trust,
+            workflow: None, // TODO: populate from workflow state when available
         }
     }
 }

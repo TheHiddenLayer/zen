@@ -159,6 +159,7 @@ mod architecture_tests {
             notification: None,
             show_keymap: false,
             trust_enabled: false,
+            workflow: None,
         };
 
         let start = Instant::now();
