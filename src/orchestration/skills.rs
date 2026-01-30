@@ -8,12 +8,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::sleep;
 
 use crate::error::{Error, Result};
 use crate::workflow::{Workflow, WorkflowConfig, WorkflowId, WorkflowPhase, WorkflowState, WorkflowStatus};
 use crate::{zlog, zlog_debug};
 
-use super::{AgentEvent, AgentPool, AIHumanProxy, ClaudeHeadless};
+use super::{AgentEvent, AgentHandle, AgentOutput, AgentPool, AIHumanProxy, ClaudeHeadless};
 
 /// Events emitted by the PhaseController during phase transitions.
 ///
@@ -182,6 +183,101 @@ impl PhaseController {
                 | (WorkflowPhase::Merging, WorkflowPhase::Complete)
                 | (WorkflowPhase::Documentation, WorkflowPhase::Complete)
         )
+    }
+}
+
+/// Configuration for the agent output monitor loop.
+///
+/// Controls polling interval and timeout behavior for monitoring agent output.
+#[derive(Debug, Clone)]
+pub struct MonitorConfig {
+    /// How often to poll for new output.
+    pub poll_interval: Duration,
+    /// Maximum time to wait for agent to complete before timing out.
+    pub timeout: Duration,
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_millis(100),
+            timeout: Duration::from_secs(600), // 10 minutes
+        }
+    }
+}
+
+impl MonitorConfig {
+    /// Create a new MonitorConfig with custom values.
+    pub fn new(poll_interval: Duration, timeout: Duration) -> Self {
+        Self {
+            poll_interval,
+            timeout,
+        }
+    }
+
+    /// Create a MonitorConfig for fast polling (useful for tests).
+    pub fn fast() -> Self {
+        Self {
+            poll_interval: Duration::from_millis(10),
+            timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Result of a skill execution via the monitor loop.
+///
+/// Contains information about the skill's execution including success status,
+/// any captured output, the number of questions answered, and total duration.
+#[derive(Debug, Clone)]
+pub struct SkillResult {
+    /// Whether the skill completed successfully.
+    pub success: bool,
+    /// Optional output captured from the skill.
+    pub output: Option<String>,
+    /// Number of questions answered by AIHumanProxy during execution.
+    pub questions_answered: usize,
+    /// Total duration of the skill execution.
+    pub duration: Duration,
+}
+
+impl SkillResult {
+    /// Create a successful skill result.
+    pub fn success(questions_answered: usize, duration: Duration) -> Self {
+        Self {
+            success: true,
+            output: None,
+            questions_answered,
+            duration,
+        }
+    }
+
+    /// Create a successful skill result with output.
+    pub fn success_with_output(
+        output: impl Into<String>,
+        questions_answered: usize,
+        duration: Duration,
+    ) -> Self {
+        Self {
+            success: true,
+            output: Some(output.into()),
+            questions_answered,
+            duration,
+        }
+    }
+
+    /// Create a failed skill result.
+    pub fn failure(duration: Duration) -> Self {
+        Self {
+            success: false,
+            output: None,
+            questions_answered: 0,
+            duration,
+        }
+    }
+
+    /// Check if the skill completed successfully.
+    pub fn is_success(&self) -> bool {
+        self.success
     }
 }
 
@@ -491,6 +587,96 @@ impl SkillsOrchestrator {
     /// Get the repository path.
     pub fn repo_path(&self) -> &Path {
         &self.repo_path
+    }
+
+    /// Monitor an agent's output and handle questions, completion, and errors.
+    ///
+    /// This is the core interaction pattern for all skill phases. The loop:
+    /// 1. Polls the agent's output at the configured interval
+    /// 2. Detects questions and answers them via AIHumanProxy
+    /// 3. Detects completion and returns success
+    /// 4. Detects errors and returns the error
+    /// 5. Times out if no completion within the configured timeout
+    ///
+    /// # Arguments
+    ///
+    /// * `agent` - The agent handle to monitor
+    /// * `config` - Configuration for polling interval and timeout
+    ///
+    /// # Returns
+    ///
+    /// A `SkillResult` on success, or an error if the agent fails or times out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The agent outputs an error
+    /// - The agent times out (returns `Error::Timeout`)
+    /// - Communication with the agent fails
+    pub async fn monitor_agent_output(
+        &self,
+        agent: &AgentHandle,
+        config: &MonitorConfig,
+    ) -> Result<SkillResult> {
+        let start = Instant::now();
+        let mut questions_answered = 0;
+        let mut last_output = String::new();
+
+        loop {
+            // Check timeout
+            let elapsed = start.elapsed();
+            if elapsed >= config.timeout {
+                zlog!("[monitor] Agent {} timed out after {:?}", agent.id, elapsed);
+                return Err(Error::Timeout(elapsed));
+            }
+
+            // Poll agent output
+            match agent.read_output() {
+                Ok(output) => match output {
+                    AgentOutput::Question(question) => {
+                        zlog_debug!("[monitor] Agent {} asked: {}", agent.id, question);
+
+                        // Answer the question via AIHumanProxy
+                        let answer = self.ai_human.answer_question(&question);
+                        zlog_debug!("[monitor] Answering with: {}", answer);
+
+                        // Send the answer back to the agent
+                        if let Err(e) = agent.send(&answer) {
+                            zlog!("[monitor] Failed to send answer to agent {}: {}", agent.id, e);
+                            return Err(e);
+                        }
+
+                        questions_answered += 1;
+                    }
+                    AgentOutput::Completed => {
+                        zlog_debug!("[monitor] Agent {} completed", agent.id);
+                        let duration = start.elapsed();
+                        return Ok(SkillResult::success_with_output(
+                            last_output,
+                            questions_answered,
+                            duration,
+                        ));
+                    }
+                    AgentOutput::Error(error) => {
+                        zlog!("[monitor] Agent {} error: {}", agent.id, error);
+                        return Err(Error::AgentNotAvailable(error));
+                    }
+                    AgentOutput::Text(text) => {
+                        // Capture output for potential use
+                        if !text.is_empty() {
+                            last_output = text;
+                        }
+                    }
+                },
+                Err(e) => {
+                    zlog!("[monitor] Failed to read agent {} output: {}", agent.id, e);
+                    return Err(e);
+                }
+            }
+
+            // Wait before next poll
+            sleep(config.poll_interval).await;
+        }
     }
 }
 
@@ -1175,5 +1361,113 @@ mod tests {
         let _event = PhaseEvent::Started {
             phase: WorkflowPhase::Planning,
         };
+    }
+
+    // ========== MonitorConfig Tests ==========
+
+    #[test]
+    fn test_monitor_config_default() {
+        let config = MonitorConfig::default();
+        assert_eq!(config.poll_interval, Duration::from_millis(100));
+        assert_eq!(config.timeout, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn test_monitor_config_new() {
+        let config = MonitorConfig::new(
+            Duration::from_millis(50),
+            Duration::from_secs(300),
+        );
+        assert_eq!(config.poll_interval, Duration::from_millis(50));
+        assert_eq!(config.timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_monitor_config_fast() {
+        let config = MonitorConfig::fast();
+        assert_eq!(config.poll_interval, Duration::from_millis(10));
+        assert_eq!(config.timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_monitor_config_debug() {
+        let config = MonitorConfig::default();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("MonitorConfig"));
+        assert!(debug.contains("poll_interval"));
+        assert!(debug.contains("timeout"));
+    }
+
+    #[test]
+    fn test_monitor_config_clone() {
+        let config = MonitorConfig::default();
+        let cloned = config.clone();
+        assert_eq!(config.poll_interval, cloned.poll_interval);
+        assert_eq!(config.timeout, cloned.timeout);
+    }
+
+    // ========== SkillResult Tests ==========
+
+    #[test]
+    fn test_skill_result_success() {
+        let result = SkillResult::success(5, Duration::from_secs(10));
+        assert!(result.success);
+        assert!(result.output.is_none());
+        assert_eq!(result.questions_answered, 5);
+        assert_eq!(result.duration, Duration::from_secs(10));
+        assert!(result.is_success());
+    }
+
+    #[test]
+    fn test_skill_result_success_with_output() {
+        let result = SkillResult::success_with_output(
+            "Task completed",
+            3,
+            Duration::from_secs(5),
+        );
+        assert!(result.success);
+        assert_eq!(result.output, Some("Task completed".to_string()));
+        assert_eq!(result.questions_answered, 3);
+        assert_eq!(result.duration, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_skill_result_failure() {
+        let result = SkillResult::failure(Duration::from_secs(2));
+        assert!(!result.success);
+        assert!(result.output.is_none());
+        assert_eq!(result.questions_answered, 0);
+        assert_eq!(result.duration, Duration::from_secs(2));
+        assert!(!result.is_success());
+    }
+
+    #[test]
+    fn test_skill_result_debug() {
+        let result = SkillResult::success(1, Duration::from_millis(100));
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("SkillResult"));
+        assert!(debug.contains("success"));
+    }
+
+    #[test]
+    fn test_skill_result_clone() {
+        let result = SkillResult::success_with_output("test", 2, Duration::from_secs(1));
+        let cloned = result.clone();
+        assert_eq!(result.success, cloned.success);
+        assert_eq!(result.output, cloned.output);
+        assert_eq!(result.questions_answered, cloned.questions_answered);
+        assert_eq!(result.duration, cloned.duration);
+    }
+
+    // ========== Module Export Tests for New Types ==========
+
+    #[test]
+    fn test_monitor_config_is_accessible() {
+        let _config = MonitorConfig::default();
+    }
+
+    #[test]
+    fn test_skill_result_is_accessible() {
+        let _result = SkillResult::success(0, Duration::ZERO);
     }
 }

@@ -14,4 +14,4 @@ mod skills;
 pub use ai_human::{AIHumanProxy, ClaudeBackendConfig, ConversationContext};
 pub use claude::{ClaudeHeadless, ClaudeResponse, ResultType, SessionManager, DEFAULT_TIMEOUT_SECS};
 pub use pool::{AgentEvent, AgentHandle, AgentOutput, AgentPool};
-pub use skills::{PhaseController, PhaseEvent, SkillsOrchestrator, WorkflowResult};
+pub use skills::{MonitorConfig, PhaseController, PhaseEvent, SkillResult, SkillsOrchestrator, WorkflowResult};
