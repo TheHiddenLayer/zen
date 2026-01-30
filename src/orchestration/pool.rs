@@ -579,6 +579,18 @@ impl AgentPool {
 
         Ok(handle)
     }
+
+    /// Set the event sender channel.
+    ///
+    /// This allows replacing the event channel, which is useful when
+    /// a different component needs to receive agent events.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_tx` - The new event sender channel
+    pub fn set_event_sender(&mut self, event_tx: mpsc::Sender<AgentEvent>) {
+        self.event_tx = event_tx;
+    }
 }
 
 #[cfg(test)]

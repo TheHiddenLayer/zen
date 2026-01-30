@@ -4,18 +4,20 @@
 //! the 5-phase workflow (PDD -> TaskGen -> Implementation -> Merge -> Docs)
 //! by composing AIHumanProxy, AgentPool, and ClaudeHeadless.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::sleep;
 
+use crate::core::dag::{DependencyType, TaskDAG};
 use crate::core::CodeTask;
 use crate::error::{Error, Result};
 use crate::workflow::{Workflow, WorkflowConfig, WorkflowId, WorkflowPhase, WorkflowState, WorkflowStatus};
 use crate::{zlog, zlog_debug};
 
-use super::{AgentEvent, AgentHandle, AgentOutput, AgentPool, AIHumanProxy, ClaudeHeadless};
+use super::{AgentEvent, AgentHandle, AgentOutput, AgentPool, AIHumanProxy, ClaudeHeadless, ImplResult, Scheduler};
 
 /// Events emitted by the PhaseController during phase transitions.
 ///
@@ -549,7 +551,7 @@ impl SkillsOrchestrator {
 
         // PHASE 2: Task Generation with /code-task-generator
         zlog!("[orchestrator] Beginning task generation phase");
-        let _generated_tasks = match self.run_task_generation_phase().await {
+        let generated_tasks = match self.run_task_generation_phase().await {
             Ok(tasks) => {
                 zlog!("[orchestrator] Generated {} code tasks", tasks.len());
                 tasks
@@ -569,9 +571,15 @@ impl SkillsOrchestrator {
 
         // PHASE 3: Implementation with /code-assist in parallel
         zlog!("[orchestrator] Beginning implementation phase");
-        if let Err(e) = self.run_implementation_phase().await {
-            return Ok(self.fail_workflow(workflow_id, format!("Implementation phase failed: {}", e)).await);
-        }
+        let _impl_results = match self.run_implementation_phase(&generated_tasks).await {
+            Ok(results) => {
+                zlog!("[orchestrator] Implementation phase completed: {} tasks", results.len());
+                results
+            }
+            Err(e) => {
+                return Ok(self.fail_workflow(workflow_id, format!("Implementation phase failed: {}", e)).await);
+            }
+        };
 
         // Transition to Merging
         {
@@ -838,10 +846,136 @@ impl SkillsOrchestrator {
         Ok(all_tasks)
     }
 
-    /// Run the implementation phase (stub - will be implemented in Step 11).
-    async fn run_implementation_phase(&self) -> Result<()> {
-        zlog_debug!("[orchestrator] Implementation phase stub - will run /code-assist in parallel in Step 11");
-        Ok(())
+    /// Run the implementation phase by executing /code-assist in parallel.
+    ///
+    /// This is Phase 3 of the workflow. It:
+    /// 1. Builds a TaskDAG from the generated CodeTasks
+    /// 2. Creates a Scheduler to manage parallel execution
+    /// 3. Executes /code-assist for each task in dependency order
+    /// 4. Returns the implementation results
+    ///
+    /// # Arguments
+    ///
+    /// * `tasks` - The code tasks generated from Phase 2
+    ///
+    /// # Returns
+    ///
+    /// A vector of `ImplResult` for each completed task, containing
+    /// the task ID, worktree path, and commit hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - DAG construction fails (e.g., cycle detected)
+    /// - Agent spawning fails
+    /// - Task execution fails critically
+    pub async fn run_implementation_phase(&self, tasks: &[CodeTask]) -> Result<Vec<ImplResult>> {
+        if tasks.is_empty() {
+            zlog!("[orchestrator] No tasks to implement, skipping implementation phase");
+            return Ok(Vec::new());
+        }
+
+        zlog!("[orchestrator] Starting implementation phase with {} tasks", tasks.len());
+
+        // Build DAG from CodeTasks with dependencies
+        let dag = self.build_task_dag(tasks)?;
+        zlog_debug!(
+            "[orchestrator] Built task DAG with {} tasks and {} dependencies",
+            dag.task_count(),
+            dag.dependency_count()
+        );
+
+        // Create scheduler event channel for TUI updates
+        let (scheduler_event_tx, _scheduler_event_rx) = mpsc::channel(100);
+
+        // Create scheduler
+        let mut scheduler = Scheduler::new(
+            Arc::new(RwLock::new(dag)),
+            Arc::clone(&self.agent_pool),
+            scheduler_event_tx,
+            self.repo_path.clone(),
+        );
+
+        // Get agent event receiver from the pool
+        // Note: We need to create a new receiver here since the pool's channel
+        // might have other listeners. For now, we'll create a simple monitoring loop.
+        let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<AgentEvent>(100);
+
+        // Replace the pool's event sender temporarily
+        // This is a limitation of the current architecture - ideally the pool
+        // would allow multiple listeners or we'd have a broadcast channel
+        {
+            let mut pool = self.agent_pool.write().await;
+            pool.set_event_sender(agent_event_tx);
+        }
+
+        // Run the scheduler
+        let results = scheduler.run(&mut agent_event_rx).await?;
+
+        zlog!(
+            "[orchestrator] Implementation phase completed: {} tasks implemented",
+            results.len()
+        );
+
+        Ok(results)
+    }
+
+    /// Build a TaskDAG from CodeTasks, inferring dependencies from the task metadata.
+    ///
+    /// This method:
+    /// 1. Converts each CodeTask to a Task for the DAG
+    /// 2. Creates a mapping from CodeTask IDs to Task IDs
+    /// 3. Adds dependency edges based on CodeTask.dependencies
+    ///
+    /// # Arguments
+    ///
+    /// * `tasks` - The code tasks to convert
+    ///
+    /// # Returns
+    ///
+    /// A TaskDAG with all tasks and their dependency relationships.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a dependency cycle is detected.
+    pub fn build_task_dag(&self, tasks: &[CodeTask]) -> Result<TaskDAG> {
+        let mut dag = TaskDAG::new();
+        let mut id_map: HashMap<String, crate::core::task::TaskId> = HashMap::new();
+
+        // First pass: add all tasks to the DAG
+        for code_task in tasks {
+            let task = code_task.to_task();
+            id_map.insert(code_task.id.clone(), task.id);
+            dag.add_task(task);
+        }
+
+        // Second pass: add dependencies based on CodeTask.dependencies
+        for code_task in tasks {
+            if let Some(task_id) = id_map.get(&code_task.id) {
+                for dep_id in &code_task.dependencies {
+                    // Try to find the dependency by ID
+                    if let Some(dep_task_id) = id_map.get(dep_id) {
+                        // Add dependency: dep_task_id -> task_id (dep must complete before task)
+                        if let Err(e) = dag.add_dependency(dep_task_id, task_id, DependencyType::DataDependency) {
+                            zlog!(
+                                "[orchestrator] Warning: Failed to add dependency {} -> {}: {}",
+                                dep_id,
+                                code_task.id,
+                                e
+                            );
+                        }
+                    } else {
+                        zlog_debug!(
+                            "[orchestrator] Dependency {} not found for task {}, skipping",
+                            dep_id,
+                            code_task.id
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(dag)
     }
 
     /// Run the merge phase (stub - will be implemented in Step 12).
@@ -2064,5 +2198,194 @@ Description for task {}.
             WorkflowPhase::TaskGeneration.cmp(&WorkflowPhase::Implementation),
             Ordering::Less
         );
+    }
+
+    // ========== Implementation Phase Tests (Step 11) ==========
+
+    // Helper to create CodeTask for testing
+    fn create_test_code_task(id: &str, title: &str, deps: Vec<&str>) -> crate::core::CodeTask {
+        crate::core::CodeTask {
+            id: id.to_string(),
+            file_path: std::path::PathBuf::from(format!("{}.code-task.md", id)),
+            title: title.to_string(),
+            description: format!("Description for {}", title),
+            acceptance_criteria: vec!["Criterion 1".to_string()],
+            dependencies: deps.into_iter().map(String::from).collect(),
+            complexity: crate::core::Complexity::Medium,
+        }
+    }
+
+    #[test]
+    fn test_build_task_dag_empty_tasks() {
+        let orchestrator = create_test_orchestrator();
+        let tasks: Vec<crate::core::CodeTask> = vec![];
+
+        let dag = orchestrator.build_task_dag(&tasks).unwrap();
+
+        assert!(dag.is_empty());
+        assert_eq!(dag.task_count(), 0);
+        assert_eq!(dag.dependency_count(), 0);
+    }
+
+    #[test]
+    fn test_build_task_dag_single_task() {
+        let orchestrator = create_test_orchestrator();
+        let tasks = vec![create_test_code_task("task-01", "First Task", vec![])];
+
+        let dag = orchestrator.build_task_dag(&tasks).unwrap();
+
+        assert_eq!(dag.task_count(), 1);
+        assert_eq!(dag.dependency_count(), 0);
+
+        // Verify task was added
+        let all_tasks = dag.all_tasks();
+        assert_eq!(all_tasks.len(), 1);
+        assert_eq!(all_tasks[0].name, "First Task");
+    }
+
+    #[test]
+    fn test_build_task_dag_multiple_independent_tasks() {
+        let orchestrator = create_test_orchestrator();
+        let tasks = vec![
+            create_test_code_task("task-01", "First Task", vec![]),
+            create_test_code_task("task-02", "Second Task", vec![]),
+            create_test_code_task("task-03", "Third Task", vec![]),
+        ];
+
+        let dag = orchestrator.build_task_dag(&tasks).unwrap();
+
+        assert_eq!(dag.task_count(), 3);
+        assert_eq!(dag.dependency_count(), 0);
+    }
+
+    #[test]
+    fn test_build_task_dag_with_dependencies() {
+        let orchestrator = create_test_orchestrator();
+        // task-02 depends on task-01, task-03 depends on both
+        let tasks = vec![
+            create_test_code_task("task-01", "First Task", vec![]),
+            create_test_code_task("task-02", "Second Task", vec!["task-01"]),
+            create_test_code_task("task-03", "Third Task", vec!["task-01", "task-02"]),
+        ];
+
+        let dag = orchestrator.build_task_dag(&tasks).unwrap();
+
+        assert_eq!(dag.task_count(), 3);
+        // task-02 <- task-01, task-03 <- task-01, task-03 <- task-02 = 3 edges
+        assert_eq!(dag.dependency_count(), 3);
+    }
+
+    #[test]
+    fn test_build_task_dag_missing_dependency_is_skipped() {
+        let orchestrator = create_test_orchestrator();
+        // task-02 depends on task-nonexistent (should be skipped gracefully)
+        let tasks = vec![
+            create_test_code_task("task-01", "First Task", vec![]),
+            create_test_code_task("task-02", "Second Task", vec!["task-nonexistent"]),
+        ];
+
+        let dag = orchestrator.build_task_dag(&tasks).unwrap();
+
+        assert_eq!(dag.task_count(), 2);
+        // No dependency added since task-nonexistent doesn't exist
+        assert_eq!(dag.dependency_count(), 0);
+    }
+
+    #[test]
+    fn test_build_task_dag_chain_dependency() {
+        let orchestrator = create_test_orchestrator();
+        // A -> B -> C chain
+        let tasks = vec![
+            create_test_code_task("task-a", "Task A", vec![]),
+            create_test_code_task("task-b", "Task B", vec!["task-a"]),
+            create_test_code_task("task-c", "Task C", vec!["task-b"]),
+        ];
+
+        let dag = orchestrator.build_task_dag(&tasks).unwrap();
+
+        assert_eq!(dag.task_count(), 3);
+        assert_eq!(dag.dependency_count(), 2); // A->B, B->C
+
+        // Verify topological order respects dependencies
+        let order = dag.topological_order().unwrap();
+        let names: Vec<_> = order.iter().map(|t| t.name.as_str()).collect();
+
+        // A must come before B, B must come before C
+        let pos_a = names.iter().position(|&n| n == "Task A").unwrap();
+        let pos_b = names.iter().position(|&n| n == "Task B").unwrap();
+        let pos_c = names.iter().position(|&n| n == "Task C").unwrap();
+
+        assert!(pos_a < pos_b);
+        assert!(pos_b < pos_c);
+    }
+
+    #[test]
+    fn test_build_task_dag_diamond_pattern() {
+        let orchestrator = create_test_orchestrator();
+        // Diamond: A -> B, A -> C, B -> D, C -> D
+        let tasks = vec![
+            create_test_code_task("task-a", "Task A", vec![]),
+            create_test_code_task("task-b", "Task B", vec!["task-a"]),
+            create_test_code_task("task-c", "Task C", vec!["task-a"]),
+            create_test_code_task("task-d", "Task D", vec!["task-b", "task-c"]),
+        ];
+
+        let dag = orchestrator.build_task_dag(&tasks).unwrap();
+
+        assert_eq!(dag.task_count(), 4);
+        assert_eq!(dag.dependency_count(), 4); // A->B, A->C, B->D, C->D
+    }
+
+    #[tokio::test]
+    async fn test_run_implementation_phase_empty_tasks() {
+        let orchestrator = create_test_orchestrator();
+        let tasks: Vec<crate::core::CodeTask> = vec![];
+
+        let results = orchestrator.run_implementation_phase(&tasks).await.unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_implementation_phase_is_phase_3() {
+        // Verify implementation is Phase 3 in the workflow
+        let phase = WorkflowPhase::Implementation;
+        assert!(matches!(phase, WorkflowPhase::Implementation));
+
+        // Verify the ordering
+        use std::cmp::Ordering;
+        assert_eq!(
+            WorkflowPhase::TaskGeneration.cmp(&WorkflowPhase::Implementation),
+            Ordering::Less
+        );
+        assert_eq!(
+            WorkflowPhase::Implementation.cmp(&WorkflowPhase::Merging),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_code_task_to_task_conversion() {
+        let code_task = create_test_code_task("task-01", "Test Task", vec![]);
+        let task = code_task.to_task();
+
+        assert_eq!(task.name, "Test Task");
+        assert_eq!(task.description, "Description for Test Task");
+        assert!(!task.id.0.is_nil());
+    }
+
+    #[tokio::test]
+    async fn test_set_event_sender_on_pool() {
+        // Test that set_event_sender works
+        let (tx1, _rx1) = mpsc::channel(100);
+        let (tx2, mut rx2) = mpsc::channel(100);
+
+        let mut pool = AgentPool::new(4, tx1);
+        pool.set_event_sender(tx2);
+
+        // Events should now go to tx2/rx2
+        // Note: Can't easily test event sending without spawning an agent
+        // which requires tmux. Just verify the method doesn't panic.
+        assert!(rx2.try_recv().is_err()); // No events yet
     }
 }

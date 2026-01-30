@@ -154,3 +154,23 @@
 - **Tests:** 83 skills tests passing, 732 total tests passing (+14 doc tests)
 - **Summary:** Implemented run_task_generation_phase() method that executes /code-task-generator as Phase 2 of the workflow. Added run_code_task_generator_phase() that spawns an agent, sends /code-task-generator command with plan.md path as input, monitors via AIHumanProxy for questions, and scans for generated .code-task.md files. Searches multiple paths (repo root, .sop, .sop/planning/implementation) for generated tasks. Deduplicates tasks by ID. Added NoCodeTasksGenerated error variant. Updated execute() to capture generated tasks for use in implementation phase (Step 11). Full test coverage including: PDD artifact requirement, agent spawning, search paths, error handling, CodeTask integration, and phase ordering validation.
 
+## Step 10: DAG Scheduler with Parallel Execution
+
+### Task 10.1: Create Scheduler Core - COMPLETED
+- **Commit:** 95b5cb3
+- **Files:** src/orchestration/scheduler.rs, src/orchestration/mod.rs
+- **Tests:** 28 scheduler tests passing, 760 total tests passing (+14 doc tests)
+- **Summary:** Added Scheduler struct for parallel task execution. SchedulerEvent enum with 4 variants (TaskStarted, TaskCompleted, TaskFailed, AllTasksComplete) for TUI updates. ImplResult struct for capturing task results (task_id, worktree, commit). Scheduler manages DAG, AgentPool, event channel, and completed set. Key methods: dispatch_ready_tasks() spawns agents for ready tasks up to capacity, handle_completion() marks task complete and terminates agent to free capacity, handle_failure() handles errors, run() is main scheduling loop. Added to_workflow_task_id() conversion for bridging core::task::TaskId and workflow::TaskId types. Full test coverage including diamond DAG execution test verifying dependency respect and parallel execution.
+
+### Task 10.2: Implement Task Spawning with Worktree Isolation - COMPLETED
+- **Files:** src/orchestration/scheduler.rs
+- **Tests:** 35 scheduler tests passing, 767 total tests passing (+14 doc tests)
+- **Summary:** Implemented spawn_task() method for creating isolated git worktrees per task. Key features: Worktree created at ~/.zen/worktrees/{task-id-short}, branch created as zen/task/{task-id-short}, task updated with worktree_path and branch_name via set_worktree(). Added worktree_path_for_task() helper for consistent path generation. Updated Scheduler::new() to accept repo_path parameter for GitOps integration. dispatch_ready_tasks() now uses spawn_task() to create worktrees before spawning agents. Added create_test_scheduler_with_repo() test helper that initializes a temp git repo for integration tests. Full test coverage including: worktree creation, branch creation, task update verification, pool capacity enforcement, and path generation tests.
+
+## Step 11: Phase 3 - Parallel Code Assist Execution
+
+### Task 11.1: Implement Implementation Phase Runner - COMPLETED
+- **Files:** src/orchestration/skills.rs, src/orchestration/pool.rs
+- **Tests:** 94 skills tests passing, 781 total tests passing (+14 doc tests)
+- **Summary:** Implemented run_implementation_phase() and build_task_dag() methods in SkillsOrchestrator. build_task_dag() converts CodeTask list to TaskDAG with dependency edges inferred from CodeTask.dependencies field, using HashMap for ID mapping. run_implementation_phase() creates Scheduler, sets up agent event channel via new set_event_sender() method on AgentPool, and runs scheduler to completion. Updated execute() to pass generated_tasks from Phase 2 to run_implementation_phase(). Added comprehensive test coverage: empty tasks, single task, multiple independent tasks, dependency chains, diamond patterns, missing dependency handling, topological order verification. This enables Phase 3 parallel execution using the DAG scheduler from Step 10.
+
