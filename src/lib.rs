@@ -2,6 +2,7 @@ pub mod agent;
 pub mod config;
 pub mod error;
 pub mod git;
+pub mod git_refs;
 pub mod log;
 pub mod session;
 pub mod tmux;

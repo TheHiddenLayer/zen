@@ -40,6 +40,12 @@ pub enum Error {
 
     #[error("Task join error: {0}")]
     TaskJoin(String),
+
+    #[error("Ref already exists: {0}")]
+    RefExists(String),
+
+    #[error("Ref not found: {0}")]
+    RefNotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
