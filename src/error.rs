@@ -40,6 +40,36 @@ pub enum Error {
 
     #[error("Task join error: {0}")]
     TaskJoin(String),
+
+    #[error("Ref already exists: {0}")]
+    RefExists(String),
+
+    #[error("Ref not found: {0}")]
+    RefNotFound(String),
+
+    #[error("Invalid phase transition from {from} to {to}")]
+    InvalidPhaseTransition { from: String, to: String },
+
+    #[error("Agent pool is full (max: {max})")]
+    AgentPoolFull { max: usize },
+
+    #[error("Agent not found: {id}")]
+    AgentNotFound { id: crate::agent::AgentId },
+
+    #[error("Claude binary not found in PATH")]
+    ClaudeBinaryNotFound,
+
+    #[error("Claude execution failed: {0}")]
+    ClaudeExecutionFailed(String),
+
+    #[error("PDD artifact not found: {path}")]
+    PDDArtifactNotFound { path: String },
+
+    #[error("No code tasks found after task generation in {path}")]
+    NoCodeTasksGenerated { path: String },
+
+    #[error("Conflict resolution failed: {reason}")]
+    ConflictResolutionFailed { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

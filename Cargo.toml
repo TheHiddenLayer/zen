@@ -41,15 +41,31 @@ thiserror = "2"
 # Concurrency
 crossbeam-channel = "0.5"
 
+# CLI
+clap = { version = "4", features = ["derive"] }
+
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 uuid = { version = "1", features = ["v4", "serde"] }
 which = "8"
+regex = "1"
+
+# DAG Management
+petgraph = "0.6"
+
+# File watching
+notify = "6"
 
 # ANSI parsing
 ansi-to-tui = "7"
 
 
 [dev-dependencies]
+tempfile = "3.24.0"
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros"] }
+tokio-test = "0.4"
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"

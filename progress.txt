@@ -1,0 +1,309 @@
+# Progress Log
+
+## Step 1: Core Workflow Models and Types
+
+### Task 1.1: Create Workflow Core Types - COMPLETED
+- **Commit:** 3ccce13
+- **Files:** src/workflow/mod.rs, src/workflow/types.rs, src/lib.rs
+- **Tests:** 27 tests passing (`cargo test workflow`)
+- **Summary:** Added WorkflowId (UUID-based), WorkflowPhase (6 variants with ordering), WorkflowStatus (5 variants with default)
+
+### Task 1.2: Create Workflow and WorkflowConfig Structs - COMPLETED
+- **Commit:** 386fe78
+- **Files:** src/workflow/mod.rs, src/workflow/types.rs
+- **Tests:** 44 workflow tests passing, 199 total tests passing
+- **Summary:** Added WorkflowConfig (update_docs, max_parallel_agents, staging_branch_prefix with defaults), TaskId placeholder type, Workflow struct with lifecycle methods (new, start, complete, fail)
+
+### Task 1.3: Implement WorkflowState with Phase Transitions - COMPLETED
+- **Commit:** b9e1a37
+- **Files:** src/workflow/state.rs, src/workflow/mod.rs, src/error.rs
+- **Tests:** 77 workflow tests passing, 232 total tests passing
+- **Summary:** Added WorkflowState struct with phase transition validation (Planning->TaskGeneration->Implementation->Merging->Documentation/Complete), PhaseHistoryEntry for tracking, InvalidPhaseTransition error variant. Documentation phase is optional.
+
+## Step 2: Git State Manager Migration
+
+### Task 2.1: Create GitStateManager Structure - COMPLETED
+- **Commit:** 612a008
+- **Files:** src/state/mod.rs, src/state/manager.rs, src/lib.rs
+- **Tests:** 7 state tests passing, 239 total tests passing
+- **Summary:** Added GitStateManager struct that composes GitRefs, GitNotes, and GitOps to provide a unified interface for git-native state persistence. Includes constructor with repo validation and accessor methods for all three components.
+
+### Task 2.2: Implement Workflow Persistence via Git Notes - COMPLETED
+- **Commit:** 6e0635e
+- **Files:** src/state/manager.rs
+- **Tests:** 16 state tests passing, 248 total tests passing
+- **Summary:** Added workflow persistence methods to GitStateManager: save_workflow, load_workflow, list_workflows, delete_workflow. Each workflow stored as JSON note under refs/notes/zen/workflows/{id} namespace with corresponding ref at refs/zen/workflows/{id}. Per-workflow namespace prevents collision when multiple workflows share the same commit.
+
+### Task 2.3: Create State Migration Tool - COMPLETED
+- **Commit:** bcdd5ac
+- **Files:** src/state/migration.rs, src/state/mod.rs
+- **Tests:** 10 migration tests passing, 258 total tests passing
+- **Summary:** Added migration module with methods to transition existing Zen installations from JSON state to git-native storage. Key methods: needs_migration(), migrate(), migrate_if_needed(), is_migrated(), migration_marker_commit(). Creates marker ref at refs/zen/migrated to track completion. Migration is idempotent and backward compatible - sessions continue using JSON while workflows use git-native storage.
+
+## Step 3: AI-as-Human Proxy Foundation
+
+### Task 3.1: Create AIHumanProxy Core Structure - COMPLETED
+- **Commit:** 7d73f05
+- **Files:** src/orchestration/mod.rs, src/orchestration/ai_human.rs, src/lib.rs
+- **Tests:** 29 orchestration tests passing, 287 total tests passing (+3 doc tests)
+- **Summary:** Added AIHumanProxy struct that autonomously answers skill clarification questions on behalf of the user. Includes ConversationContext for Q&A history tracking, mock answer generation based on question patterns (database, yes/no, name, etc.), and escalation detection for preference-based questions. Uses Arc<RwLock<ConversationContext>> for thread-safe context sharing.
+
+### Task 3.2: Implement ConversationContext Tracking - COMPLETED
+- **Commit:** 3f03a84
+- **Files:** src/orchestration/ai_human.rs
+- **Tests:** 47 orchestration tests passing, 305 total tests passing (+6 doc tests)
+- **Summary:** Enhanced ConversationContext with decisions HashMap for tracking key decisions extracted from Q&A pairs. Implemented decision extraction heuristics in record() method for naming, database, technology, and architecture decisions. Added decisions() accessor method. Added 18 new tests for decision extraction covering all acceptance criteria.
+
+## Step 4: Agent Pool Enhancements
+
+### Task 4.1: Add AgentId and AgentStatus Types - COMPLETED
+- **Commit:** 421ef61
+- **Files:** src/agent.rs
+- **Tests:** 24 agent tests passing, 325 total tests passing (+6 doc tests)
+- **Summary:** Added AgentId (UUID-based newtype following SessionId/WorkflowId pattern) with new(), short(), Default, Display, FromStr, and Serialize/Deserialize. Added AgentStatus enum with 5 variants: Idle, Running { task_id }, Stuck { since, reason }, Failed { error }, Terminated. Implemented Default (Idle) and Display for AgentStatus. Note: Stuck variant uses Instant which cannot be serialized - documented for future handling.
+
+### Task 4.2: Create AgentPool for Multi-Agent Management - COMPLETED
+- **Commit:** 80335aa
+- **Files:** src/orchestration/pool.rs, src/orchestration/mod.rs, src/error.rs
+- **Tests:** 34 pool tests passing, 359 total tests passing (+6 doc tests)
+- **Summary:** Added AgentPool struct that manages multiple concurrent agents with capacity limits and event emission via tokio mpsc channel. Includes AgentEvent enum (Started, Completed, Failed, StuckDetected, Terminated), AgentHandle placeholder struct with id/status/task_id fields, and AgentPool methods (new, spawn stub, terminate, get, active_count, has_capacity, max_concurrent). Added AgentPoolFull and AgentNotFound error variants. Full spawning implementation deferred to Task 4.3.
+
+### Task 4.3: Implement AgentHandle for Agent Communication - COMPLETED
+- **Commit:** 48f38c9
+- **Files:** src/orchestration/pool.rs, src/orchestration/mod.rs
+- **Tests:** 70 pool tests passing, 395 total tests passing (+6 doc tests)
+- **Summary:** Implemented full AgentHandle with tmux session communication. Added AgentOutput enum (Text, Question, Completed, Error) with pattern-based parsing for detecting questions, completion markers, and errors. Enhanced AgentHandle with new fields (tmux_session, worktree_path, started_at, last_activity, cancel_token) and communication methods (send, read_output, read_raw_output, read_output_tail, last_commit). Added activity tracking (touch_activity, idle_duration, running_duration) and cancellation support.
+
+## Step 5: Claude Code Headless Integration
+
+### Task 5.1: Create ClaudeHeadless Executor - COMPLETED
+- **Commit:** e88c1dd
+- **Files:** src/orchestration/claude.rs, src/orchestration/mod.rs, src/error.rs
+- **Tests:** 33 claude tests passing, 427 total tests passing (+6 doc tests)
+- **Summary:** Added ClaudeHeadless struct that executes Claude Code in headless mode (-p flag) with JSON output parsing. Includes ResultType enum (Success/Error), ClaudeResponse struct with session_id/result/cost/duration fields, binary detection via `which` crate, async execution with tokio::process::Command, and configurable timeout (default 10 minutes). Added ClaudeBinaryNotFound and ClaudeExecutionFailed error variants.
+
+### Task 5.2: Implement Claude Session Continuation - COMPLETED
+- **Commit:** d32569f
+- **Files:** src/orchestration/claude.rs, src/orchestration/ai_human.rs, src/orchestration/mod.rs
+- **Tests:** 59 claude tests passing, 176 orchestration tests passing, 454 total tests passing (+7 doc tests)
+- **Summary:** Added session continuation support to ClaudeHeadless with continue_session() and continue_session_with_model() methods using --resume flag. Created SessionManager for tracking active sessions with register/get/remove/clear operations. Enhanced AIHumanProxy with optional Claude backend via ClaudeBackendConfig struct, supporting real Claude responses instead of mock patterns. Added set_session_id() and clear_session() methods for session lifecycle management. Full test coverage for SessionManager operations and AIHumanProxy Claude backend configuration.
+
+## Step 6: Skills Orchestrator Skeleton
+
+### Task 6.1: Create SkillsOrchestrator Structure - COMPLETED
+- **Commit:** 7ac82ec
+- **Files:** src/orchestration/skills.rs, src/orchestration/mod.rs
+- **Tests:** 21 skills tests passing, 475 total tests passing (+7 doc tests)
+- **Summary:** Added SkillsOrchestrator struct that coordinates the full workflow phases by composing AIHumanProxy, AgentPool, WorkflowState, and ClaudeHeadless. Includes WorkflowResult struct with workflow_id, status, and summary fields. Implemented constructor (new) that initializes all components with WorkflowConfig and repo_path. Added execute() method skeleton that runs through all phase stubs (Planning, TaskGeneration, Implementation, Merging, Documentation) with proper phase transition logging. Exports accessible via `zen::orchestration::SkillsOrchestrator` and `zen::orchestration::WorkflowResult`.
+
+### Task 6.2: Implement PhaseController - COMPLETED
+- **Commit:** e384446
+- **Files:** src/orchestration/skills.rs, src/orchestration/mod.rs
+- **Tests:** 53 skills tests passing, 507 total tests passing (+7 doc tests)
+- **Summary:** Added PhaseController struct that manages workflow phase transitions and emits events for TUI updates. Includes PhaseEvent enum (Started, Changed, Completed variants), phase history tracking with timestamps (Instant), elapsed() for duration measurement, transition() with validation following workflow rules, and event emission via tokio mpsc channel. Full test coverage with 32 new tests covering valid/invalid transitions, timing, event emission, and history tracking.
+
+### Task 6.3: Implement Agent Output Monitor Loop - COMPLETED
+- **Commit:** aea47c3
+- **Files:** src/orchestration/skills.rs, src/orchestration/mod.rs
+- **Tests:** 65 skills tests passing, 519 total tests passing (+7 doc tests)
+- **Summary:** Added monitor_agent_output() method to SkillsOrchestrator that implements the core interaction pattern for all skill phases. New types: MonitorConfig (poll_interval, timeout with sensible defaults) and SkillResult (success, output, questions_answered, duration). The loop polls agent output, detects questions and answers via AIHumanProxy, handles completion/error/timeout conditions. Enables autonomous workflow execution without human intervention.
+
+## Step 7: Phase 1 - PDD Skill Integration
+
+### Task 7.1: Implement PDD Phase Runner - COMPLETED
+- **Commit:** 1dd1c56
+- **Files:** src/orchestration/skills.rs, src/orchestration/pool.rs, src/orchestration/mod.rs, src/error.rs
+- **Tests:** 72 skills tests passing, 79 pool tests passing, 534 total tests passing (+7 doc tests)
+- **Summary:** Implemented PDD phase runner that executes /pdd skill as Phase 1 of the workflow. Added PDDResult struct with design_path, plan_path, and research_dir fields, plus from_directory() method with artifact validation. Added spawn_for_skill() method to AgentPool for spawning skill-specific agents with synthetic task IDs and skill-named tmux sessions. Implemented run_pdd_phase() in SkillsOrchestrator that spawns agent, sends /pdd command with user prompt as rough_idea, monitors via AIHumanProxy, and validates PDD artifacts. Added PDDArtifactNotFound error variant. Updated execute() tests to handle planning phase failure in test environment (no tmux).
+
+### Task 7.2: Implement Question Detection in Agent Output - COMPLETED
+- **Commit:** 1e0370e
+- **Files:** src/orchestration/detection.rs, src/orchestration/mod.rs, src/orchestration/pool.rs, Cargo.toml
+- **Tests:** 50 detection tests passing, 584 total tests passing (+11 doc tests)
+- **Summary:** Added detection module with robust question detection patterns for agent output. Implemented is_question() for detecting direct questions, numbered options, yes/no prompts, and input prompts. Implemented extract_question() for extracting clean question text from surrounding context. Implemented is_waiting_for_input() for detecting prompt/waiting state. Added regex dependency. Integrated with AgentOutput::contains_question_pattern() to centralize question detection logic.
+
+## Step 8: Task and DAG Data Models
+
+### Task 8.1: Create Task Data Model - COMPLETED
+- **Commit:** 7ddcc37
+- **Files:** src/core/mod.rs, src/core/task.rs, src/lib.rs
+- **Tests:** 39 core tests passing, 623 total tests passing (+11 doc tests)
+- **Summary:** Added core module with Task data model for execution DAG. TaskId (UUID-based newtype with short(), Display, FromStr, serde). TaskStatus enum with 6 variants (Pending, Ready, Running, Completed, Failed, Blocked). Task struct tracks id, name, description, status, worktree_path, branch_name, agent_id, created_at, started_at, completed_at, commit_hash. Lifecycle methods: new(), start(), complete(), fail(), mark_ready(), block(). Helper methods: assign_agent(), set_worktree(), set_commit(), is_finished(), can_start(). Full serde support for git notes persistence.
+
+### Task 8.2: Create TaskDAG Structure with petgraph - COMPLETED
+- **Commit:** 5cef1f9
+- **Files:** src/core/dag.rs, src/core/mod.rs, Cargo.toml
+- **Tests:** 78 core tests passing, 662 total tests passing (+11 doc tests)
+- **Summary:** Added petgraph 0.6 dependency. Created TaskDAG struct using DiGraph<Task, DependencyType> for task dependency management. DependencyType enum with 3 variants: DataDependency, FileDependency{files}, SemanticDependency{reason}. TaskDAG implements: new(), add_task() with deduplication, add_dependency() with cycle detection using petgraph::algo::is_cyclic_directed, get_task()/get_task_mut(), get_node_index(), has_dependency(), get_dependency(), get_dependencies() (predecessors), get_dependents() (successors), all_tasks(), task_count(), dependency_count(), is_empty(), contains_task(), graph() accessor. Full serde support for DependencyType. 39 comprehensive tests covering all acceptance criteria.
+
+### Task 8.3: Implement DAG Scheduling Operations - COMPLETED
+- **Commit:** 44b3156
+- **Files:** src/core/dag.rs
+- **Tests:** 64 DAG tests passing, 690 total tests passing (+11 doc tests)
+- **Summary:** Added scheduling operations to TaskDAG for parallel task execution. ready_tasks(&self, completed: &HashSet<TaskId>) returns tasks where all dependencies are satisfied (incoming edges in completed set). complete_task(&mut self, id: &TaskId) marks a task as completed with timestamp. all_complete(&self, completed: &HashSet<TaskId>) checks if all tasks in the DAG are complete. topological_order(&self) returns tasks in dependency-respecting order using petgraph::algo::toposort. pending_count(&self, completed: &HashSet<TaskId>) returns count of incomplete tasks. All acceptance criteria verified: diamond pattern A->C, B->C, D returns [A, B, D] for ready_tasks({}), chain A->B->C returns [B] for ready_tasks({A}), topological order respects dependencies.
+
+## Step 9: Phase 2 - Code Task Generator Integration
+
+### Task 9.1: Create CodeTask Parser - COMPLETED
+- **Files:** src/core/code_task.rs, src/core/mod.rs
+- **Tests:** 34 code_task tests passing, 724 total tests passing (+14 doc tests)
+- **Summary:** Added CodeTask struct and Complexity enum for parsing .code-task.md files generated by /code-task-generator. CodeTask has fields: id (from filename), file_path, title, description, acceptance_criteria (Vec), dependencies (Vec), complexity. Complexity enum with Low/Medium/High variants, Default=Medium, serde support. Implemented from_file() that parses markdown sections (# Task: title, ## Description, ## Acceptance Criteria, ## Dependencies, ## Metadata with **Complexity**: value). Implemented from_directory() that scans for .code-task.md files and returns sorted Vec<CodeTask>. Implemented to_task() converting CodeTask to Task for DAG. Handles missing optional fields with defaults, numbered and bulleted lists, multiline descriptions.
+
+### Task 9.2: Implement Task Generation Phase - COMPLETED
+- **Files:** src/orchestration/skills.rs, src/error.rs
+- **Tests:** 83 skills tests passing, 732 total tests passing (+14 doc tests)
+- **Summary:** Implemented run_task_generation_phase() method that executes /code-task-generator as Phase 2 of the workflow. Added run_code_task_generator_phase() that spawns an agent, sends /code-task-generator command with plan.md path as input, monitors via AIHumanProxy for questions, and scans for generated .code-task.md files. Searches multiple paths (repo root, .sop, .sop/planning/implementation) for generated tasks. Deduplicates tasks by ID. Added NoCodeTasksGenerated error variant. Updated execute() to capture generated tasks for use in implementation phase (Step 11). Full test coverage including: PDD artifact requirement, agent spawning, search paths, error handling, CodeTask integration, and phase ordering validation.
+
+## Step 10: DAG Scheduler with Parallel Execution
+
+### Task 10.1: Create Scheduler Core - COMPLETED
+- **Commit:** 95b5cb3
+- **Files:** src/orchestration/scheduler.rs, src/orchestration/mod.rs
+- **Tests:** 28 scheduler tests passing, 760 total tests passing (+14 doc tests)
+- **Summary:** Added Scheduler struct for parallel task execution. SchedulerEvent enum with 4 variants (TaskStarted, TaskCompleted, TaskFailed, AllTasksComplete) for TUI updates. ImplResult struct for capturing task results (task_id, worktree, commit). Scheduler manages DAG, AgentPool, event channel, and completed set. Key methods: dispatch_ready_tasks() spawns agents for ready tasks up to capacity, handle_completion() marks task complete and terminates agent to free capacity, handle_failure() handles errors, run() is main scheduling loop. Added to_workflow_task_id() conversion for bridging core::task::TaskId and workflow::TaskId types. Full test coverage including diamond DAG execution test verifying dependency respect and parallel execution.
+
+### Task 10.2: Implement Task Spawning with Worktree Isolation - COMPLETED
+- **Files:** src/orchestration/scheduler.rs
+- **Tests:** 35 scheduler tests passing, 767 total tests passing (+14 doc tests)
+- **Summary:** Implemented spawn_task() method for creating isolated git worktrees per task. Key features: Worktree created at ~/.zen/worktrees/{task-id-short}, branch created as zen/task/{task-id-short}, task updated with worktree_path and branch_name via set_worktree(). Added worktree_path_for_task() helper for consistent path generation. Updated Scheduler::new() to accept repo_path parameter for GitOps integration. dispatch_ready_tasks() now uses spawn_task() to create worktrees before spawning agents. Added create_test_scheduler_with_repo() test helper that initializes a temp git repo for integration tests. Full test coverage including: worktree creation, branch creation, task update verification, pool capacity enforcement, and path generation tests.
+
+## Step 11: Phase 3 - Parallel Code Assist Execution
+
+### Task 11.1: Implement Implementation Phase Runner - COMPLETED
+- **Files:** src/orchestration/skills.rs, src/orchestration/pool.rs
+- **Tests:** 94 skills tests passing, 781 total tests passing (+14 doc tests)
+- **Summary:** Implemented run_implementation_phase() and build_task_dag() methods in SkillsOrchestrator. build_task_dag() converts CodeTask list to TaskDAG with dependency edges inferred from CodeTask.dependencies field, using HashMap for ID mapping. run_implementation_phase() creates Scheduler, sets up agent event channel via new set_event_sender() method on AgentPool, and runs scheduler to completion. Updated execute() to pass generated_tasks from Phase 2 to run_implementation_phase(). Added comprehensive test coverage: empty tasks, single task, multiple independent tasks, dependency chains, diamond patterns, missing dependency handling, topological order verification. This enables Phase 3 parallel execution using the DAG scheduler from Step 10.
+
+### Task 11.2: Implement Progress Tracking - COMPLETED
+- **Commit:** 8e01738
+- **Files:** src/state/manager.rs, src/orchestration/scheduler.rs, src/tea/message.rs, src/tea/update.rs
+- **Tests:** 68 state tests passing, 137 core tests passing, 77 workflow tests passing
+- **Summary:** Added progress tracking to the Scheduler that updates task status in GitStateManager and emits events for TUI display. GitStateManager task persistence with save_task(), load_task(), list_tasks(), delete_task() methods using per-task namespace in git notes. Scheduler progress tracking with state_manager field, with_state_manager() builder, progress_percentage() method (3/5=60%), emit_progress() and persist_task() helpers. TEA Message variants (TaskStarted, TaskProgress, TaskCompleted, TaskFailed) for TUI integration. Acceptance criteria verified: progress calculation, status persistence, completion recording with commit hash, and real-time event emission.
+
+## Step 12: Phase 4 - Merge and Conflict Resolution
+
+### Task 12.1: Create ConflictResolver Structure - COMPLETED
+- **Files:** src/orchestration/resolver.rs, src/orchestration/mod.rs
+- **Tests:** 16 resolver tests passing
+- **Summary:** Added ConflictResolver struct that handles merging task worktrees to the staging branch and detecting merge conflicts. Created MergeResult enum with Success{commit}, Conflicts{files}, and Failed{error} variants, plus helper methods (is_success(), commit(), conflict_files(), error()). Created ConflictFile struct with path, ours, theirs, and base fields for capturing three-way merge content. ConflictResolver holds GitOps for git commands and Arc<RwLock<AgentPool>> for spawning resolver agents. Exported ConflictResolver, MergeResult, and ConflictFile from orchestration module.
+
+### Task 12.2: Implement Merge Logic - COMPLETED
+- **Commit:** 5c37cd3
+- **Files:** src/orchestration/resolver.rs, src/orchestration/mod.rs
+- **Tests:** 24 resolver tests passing (8 new merge tests)
+- **Summary:** Implemented merge() method in ConflictResolver that attempts to merge task worktrees into a staging branch. Key features: merge(worktree, staging_branch) performs full merge workflow, handles fast-forward merges efficiently, creates staging branch automatically if missing, detects merge conflicts via git2 index, extracts conflict content (ours/theirs/base) from git blobs. Implementation uses git2 crate for all merge operations: merge_analysis() for strategy, merge() with MergeOptions, index.conflicts() iterator for conflict extraction, and read_blob_content() helper for extracting file versions. All acceptance criteria verified: clean merge returns Success, conflict detection returns Conflicts, conflict content extraction captures ours/theirs/base, merge failure returns error, and multiple conflicts returns all ConflictFiles.
+
+### Task 12.3: Implement AI-Assisted Conflict Resolution - COMPLETED
+- **Files:** src/orchestration/resolver.rs
+- **Tests:** 48 resolver tests passing (10 new resolve_conflicts tests)
+- **Summary:** Implemented resolve_conflicts() async method that spawns a dedicated AI agent to resolve merge conflicts automatically. Key features: format_conflict_prompt() formats conflict context with ours/theirs/base content and instructions to use Edit tool; resolve_conflicts() spawns resolver agent via AgentPool::spawn_for_skill(), sends prompt, monitors output for completion phrase "All conflicts resolved", and handles timeout (5 minutes); verify_resolution() checks files for remaining conflict markers; commit_resolution() creates merge commit with staged files; has_conflict_markers() detects git conflict markers. Error handling returns ConflictResolutionFailed for empty conflicts, spawn failures, agent errors, timeout, and unresolved markers. All acceptance criteria verified: resolver spawn, context provision with ours/theirs, verification of marker removal, commit creation, and resolution failure escalation.
+
+## Step 13: Phase 5 - Codebase Summary Integration
+
+### Task 13.1: Implement Documentation Phase - COMPLETED
+- **Files:** src/orchestration/skills.rs
+- **Tests:** 106 skills tests passing (12 new documentation phase tests)
+- **Summary:** Implemented run_documentation_phase() method in SkillsOrchestrator that executes /codebase-summary as Phase 5 of the workflow. Key features: Phase is optional, controlled by WorkflowConfig.update_docs flag (defaults to true); when update_docs=false, returns immediately without spawning agent; when update_docs=true, spawns agent via spawn_for_skill("codebase-summary"), sends /codebase-summary command, and monitors for completion via AIHumanProxy. Documentation failure is non-critical - workflow continues even if this phase fails. Added comprehensive test coverage: skip path verification, agent spawn attempt verification, config checking from workflow state, phase ordering validation (Merging → Documentation → Complete), and workflow integration tests. All acceptance criteria verified: phase skip when disabled, phase execute when enabled, error handling that allows workflow to continue.
+
+### Task 13.2: Implement Merge Phase Runner - COMPLETED
+- **Files:** src/orchestration/skills.rs
+- **Tests:** 115 skills tests passing (7 new merge phase tests)
+- **Summary:** Implemented run_merge_phase() method in SkillsOrchestrator that orchestrates merging all completed task worktrees into a staging branch. Key features: Creates staging branch name from WorkflowConfig.staging_branch_prefix + workflow_id.short() (e.g., "zen/staging/abc12345"); creates ConflictResolver with GitOps and AgentPool; merges each ImplResult worktree in sequence; handles clean merges (Success), conflicted merges (Conflicts with AI-assisted resolution via resolve_conflicts()), and failed merges (returns ConflictResolutionFailed error). Updated execute() to pass impl_results from Phase 3 to run_merge_phase(). Empty results skip the phase. Comprehensive test coverage: empty results handling, staging branch naming, phase ordering (Implementation → Merging), phase transitions, and ImplResult construction. All acceptance criteria verified: staging branch creation, sequential merging, conflict handling via resolver, all merged confirmation, and failure escalation.
+
+## Step 14: Health Monitor and Stuck Detection
+
+### Task 14.1: Create Health Monitor - COMPLETED
+- **Files:** src/orchestration/health.rs, src/orchestration/mod.rs, src/orchestration/pool.rs
+- **Tests:** 32 health tests passing
+- **Summary:** Added HealthMonitor struct that detects stuck or failing agents by monitoring activity timestamps and output patterns. Created HealthConfig with stuck_threshold (5 min default), max_retries (3 default), and stuck_patterns (rate limit, timeout, etc). Created HealthEvent enum with AgentStuck{agent_id, duration}, AgentFailed{agent_id, error}, and RecoveryTriggered{agent_id, action} variants. Created RecoveryAction enum with Restart, Reassign{to_agent}, Decompose{into_tasks}, Escalate{message}, and Abort variants. HealthMonitor implements check_agent() examining idle_duration against threshold and output patterns, check_all() iterating all agents via new agents_iter() method on AgentPool, and is_healthy() helper. Pattern detection checks agent output for stuck indicators like "rate limit", "timeout", "connection refused". All acceptance criteria verified: stuck detection after threshold, pattern detection for "rate limit", healthy agent returns None, check_all returns only unhealthy events, and configurable threshold.
+
+### Task 14.2: Implement AI-Driven Recovery - COMPLETED
+- **Commit:** afb83d5
+- **Files:** src/orchestration/health.rs, src/orchestration/mod.rs
+- **Tests:** 65 health tests passing (33 new recovery tests)
+- **Summary:** Implemented AI-driven recovery for HealthMonitor with determine_recovery() and execute_recovery() methods. Added RetryTracker struct for tracking retry counts per task with increment/reset/clear operations. determine_recovery() uses heuristic-based analysis of agent output patterns to decide recovery actions: Escalate when max retries exceeded, Restart for transient errors (rate limit, timeout, connection refused), Abort for fatal errors after retries (permission denied, authentication failed), Decompose for complex task indicators. execute_recovery() performs the recovery action (terminate agent, emit events, increment retry count for Restart). Added build_recovery_prompt() for future AI integration with ClaudeHeadless and parse_recovery_action() for parsing AI responses. All acceptance criteria verified: restart decision for transient errors, decompose decision for complex tasks, escalate when max retries exceeded, recovery execution terminates agent and re-queues task, retry tracking considered in decisions.
+
+## Step 15: Reactive Planner (Plan Change Detection)
+
+### Task 15.1: Implement File Watcher for Plan Changes - COMPLETED
+- **Files:** src/orchestration/planner.rs, src/orchestration/mod.rs, Cargo.toml
+- **Tests:** 34 planner tests passing
+- **Summary:** Added ReactivePlanner struct that monitors .sop/planning/ for changes to plan or design files, enabling reactive replanning during workflow execution. Created PlanEvent enum with 4 variants: FileChanged{path}, ReplanTriggered, TasksAdded{tasks}, TasksCancelled{tasks}. Created PlannerConfig with watch_paths, debounce_duration (1 second default), and relevant_patterns (plan.md, detailed-design.md, .code-task.md). ReactivePlanner uses notify crate (v6) for cross-platform file watching with is_relevant_file() filtering and should_process_change() debouncing. Key methods: new(), with_defaults(), start_watching() returns watcher handle, emit_file_changed/replan_triggered/tasks_added/tasks_cancelled() async event emitters. All acceptance criteria verified: watch setup for .sop/planning/, change detection emits FileChanged, debouncing coalesces 5 rapid changes to 1 event, irrelevant files filtered, errors logged but don't crash system.
+
+### Task 15.2: Implement Replanning Logic - COMPLETED
+- **Files:** src/orchestration/planner.rs, src/core/task.rs, src/orchestration/mod.rs
+- **Tests:** 50 planner tests passing, 45 core task tests passing
+- **Summary:** Implemented replanning logic that diffs updated plans against current tasks and updates the DAG without interrupting running agents. Added Cancelled variant to TaskStatus with reason field and cancel() method on Task. Created TaskDiff struct with added/removed/modified fields, has_changes() and change_count() helpers. Implemented diff_tasks() for comparing old vs new task lists by name, detecting added tasks, removed tasks (skipping Running/Completed/Cancelled), and modified tasks (description changes, preserving original TaskId). Implemented on_plan_changed() to emit ReplanTriggered event and call replan(). Implemented replan() to scan .code-task.md files from multiple paths, convert to Tasks, compute diff, and apply changes via apply_diff(). Implemented apply_diff() to add new tasks to DAG, cancel removed tasks, update modified task descriptions, and emit TasksAdded/TasksCancelled events. All acceptance criteria verified: 2 new tasks added to DAG, removed pending task marked cancelled (not deleted), running tasks continue uninterrupted, ReplanTriggered event emitted, modified task appears in modified list.
+
+## Step 16: TUI Dashboard Enhancements
+
+### Task 16.1: Create Workflow UI Components - COMPLETED
+- **Commit:** fb1e83d
+- **Files:** src/render.rs, src/ui.rs, src/lib.rs, src/tea/model.rs
+- **Tests:** 24 tests passing (12 render tests, 12 ui tests)
+- **Summary:** Added WorkflowView struct in render.rs for workflow display state, following SessionView pattern. Extended RenderState with optional workflow field. Implemented render_workflow_header() showing workflow name and status with color coding (Running=green, Completed=cyan, Failed=red, Paused=yellow). Implemented render_phase_progress() with 5-phase indicator (Planning→TaskGen→Impl→Merge→Docs) highlighting current phase and progress bar using Gauge widget. Added workflow_status_color() and workflow_status_label() helpers. All acceptance criteria verified: Implementation phase highlighted in list, 60% progress bar for 3/5 phases, workflow header shows name and status, "No active workflow" message when none, phase transitions update immediately.
+
+### Task 16.2: Create Multi-Agent Grid Display - COMPLETED
+- **Files:** src/render.rs, src/ui.rs, src/lib.rs, src/tea/model.rs
+- **Tests:** 48 tests passing (24 render tests, 24 ui tests)
+- **Summary:** Added AgentView struct in render.rs for agent display state with id, task_name, status, elapsed, output_preview fields. Added format_elapsed() for human-readable duration (e.g., "2m 30s"), status_label() for status text, output_lines() for last N lines preview. Extended RenderState with agents Vec<AgentView> and selected_agent fields. Implemented render_agent_grid() in ui.rs displaying agents in adaptive grid layout (1x1, 1x2, 2x2, 2x3, 3x3 based on count). Added calculate_grid_layout() for optimal grid calculation, render_agent_cell() for individual cells, render_agent_header() with status indicator symbols (● running, ⚠ stuck, ✗ failed, ○ idle, ✓ done), render_agent_elapsed() for time display, render_agent_output_preview() for last few output lines. Status colors: green=running, yellow=stuck, red=failed, gray=idle, cyan=terminated. Selection highlight uses REVERSED modifier. All acceptance criteria verified: 4 agents shows 2x2 grid, running status shows green indicator, last 3 output lines shown, arrow key selection highlights cell, elapsed time formatted as "2m 30s".
+
+### Task 16.3: Create DAG Visualization - COMPLETED
+- **Files:** src/render.rs, src/ui.rs, src/lib.rs, src/tea/model.rs
+- **Tests:** 69 tests passing (36 render tests, 40 ui tests - includes 29 new DAG tests)
+- **Summary:** Added TaskView struct for task display with name and status, and TaskDAGView struct for DAG visualization with tasks and edges lists. Implemented compute_layers() for topological layer calculation used in ASCII layout. Added dag and show_dag fields to RenderState. Implemented render_task_dag() in ui.rs that renders ASCII boxes with status labels ([name:status]) and connecting arrows. Added dag_to_ascii_string() helper for testing. Task status colors: green=completed, cyan=running, yellow=ready, gray=pending, red=failed, magenta=blocked, dimmed=cancelled. All acceptance criteria verified: 5 tasks render as 5 ASCII boxes with names, A->C dependency shows arrow connecting A to C, completed task shows green status, 'd' key toggle prepares show_dag flag, complex DAG with 10 tasks renders all visible.
+
+## Step 17: CLI Commands (run, review, accept, reject)
+
+### Task 17.1: Define CLI Command Structure - COMPLETED
+- **Files:** src/main.rs, Cargo.toml
+- **Tests:** 22 CLI tests passing
+- **Summary:** Added clap 4 dependency with derive feature. Defined Cli struct with Parser derive for main CLI entry point with --trust/-t and --debug/-d global flags. Defined Command enum with Subcommand derive containing 7 variants: Run (prompt + headless flag), Review (optional workflow_id), Accept (optional workflow_id), Reject (required workflow_id), Status, Attach (required agent_id), Reset (force flag). Updated main() to use Cli::parse() for argument parsing. Added placeholder handler functions (run_workflow, run_review, run_accept, run_reject, run_status, run_attach) that log and print messages. Backward compatibility maintained: no subcommand launches TUI. All acceptance criteria verified: `zen run "build auth"` returns Run command with prompt, `zen` with no args launches TUI, `zen run --headless "build auth"` sets headless=true, `zen --help` lists all commands with descriptions, `zen --trust` works as before.
+
+### Task 17.2: Implement Run and Review Commands - COMPLETED
+- **Files:** src/main.rs
+- **Tests:** 36 CLI tests passing (14 new tests)
+- **Summary:** Implemented `zen run` command that starts a workflow with SkillsOrchestrator integration. Added run_workflow() handler that validates git repository, creates WorkflowConfig, and executes orchestrator. Implemented headless mode with JSON output (workflow_id, status, summary) via run_workflow_headless(). Implemented TUI mode via run_workflow_with_tui() that shows progress and final summary with next steps. Added save_workflow_result() to persist workflow state to GitStateManager. Implemented `zen review` command that loads workflow from GitStateManager (supports short IDs and full UUIDs via parse_workflow_id()), displays comprehensive summary (ID, name, prompt, status, phase, timestamps, task count), shows staging branch diff stats and changed files list, displays warnings for failures, and suggests next steps. Added helper functions: format_status() with color codes, truncate_string(), get_diff_summary(), get_changed_files(). All acceptance criteria verified: run starts workflow and orchestrator starts, TUI shows progress without --headless, headless mode outputs JSON, review shows tasks/files/status, review shows diff vs main.
+
+### Task 17.3: Implement Accept and Reject Commands - COMPLETED
+- **Files:** src/main.rs, src/workflow/types.rs, src/git.rs, src/ui.rs
+- **Tests:** 46 CLI tests passing (10 new tests), 49 workflow type tests passing
+- **Summary:** Implemented `zen accept` and `zen reject` commands for workflow lifecycle finalization. Added `Accepted` and `Rejected` variants to WorkflowStatus enum with Display impl. Added `accept()` and `reject()` methods to Workflow struct. Added `--yes`/`-y` flag to Accept command for skipping confirmation. Implemented run_accept() that: loads workflow, verifies Completed status, shows confirmation prompt, merges staging branch to main via new merge_branch_to_main() method in GitOps, cleans up worktrees via list_worktrees_with_prefix(), deletes staging branch, marks workflow as Accepted. Implemented run_reject() that: loads workflow, verifies can be rejected, deletes staging branch, cleans up worktrees, marks workflow as Rejected, preserves task branches for debugging. Added get_main_branch() helper to GitOps for detecting main/master. Updated format_status() with cyan (Accepted) and magenta (Rejected) colors. Updated workflow_status_color() and workflow_status_label() in ui.rs for TUI support. All acceptance criteria verified: accept merges staging to main, accept cleans up worktrees, reject deletes staging branch, reject preserves task branches for debugging, confirmation prompt shows without --yes.
+
+## Step 18: Worktree Auto-Cleanup
+
+### Task 18.1: Create CleanupManager - COMPLETED
+- **Files:** src/cleanup.rs, src/lib.rs
+- **Tests:** 22 cleanup tests passing
+- **Summary:** Added CleanupManager struct that handles automatic cleanup of worktrees and resources after workflow completion. Created CleanupConfig with auto_cleanup (default true), cleanup_delay (default 0), and keep_failed (default true) fields. Created CleanupReport struct with removed/skipped/failed/orphaned lists plus helper methods (total_processed, is_success, merge). Implemented cleanup_task() that removes worktree for finished tasks (respects keep_failed config for failed tasks). Implemented cleanup_workflow() that cleans all task worktrees plus staging branch worktrees. Implemented cleanup_orphaned() that detects worktrees not linked to known workflows (reports but doesn't auto-delete). Implemented remove_orphaned() for explicit orphan cleanup. All acceptance criteria verified: completed task worktree is removed (branch kept), workflow cleanup removes all 5 task worktrees, failed task preserved when keep_failed=true, orphan detection reports unlinked worktrees, CleanupReport tracks what was cleaned.
+
+### Task 18.2: Implement Orphan Detection and Background Cleanup - COMPLETED
+- **Files:** src/cleanup.rs, src/main.rs
+- **Tests:** 49 cleanup tests passing (44 lib + 5 CLI)
+- **Summary:** Implemented orphan resource detection and background cleanup actor. Added to CleanupManager: detect_orphaned_worktrees(&self, known_ids: &HashSet<String>) scans ~/.zen/worktrees/ for worktrees not matching known workflow/task IDs; detect_orphaned_tmux(&self, active_agent_ids: &HashSet<String>) lists zen_* tmux sessions not linked to active agents; detect_orphaned_branches(&self, known_ids: &HashSet<String>) lists zen/* branches not linked to known workflows. Added remove_orphaned_tmux() and remove_orphaned_branches() methods. Created CleanupActorConfig with check_interval (5 min default) and auto_cleanup (false default). Created CleanupEvent enum (CheckCompleted, CleanupPerformed, Error). Created CleanupActor struct with run() async loop that periodically detects orphans and optionally cleans them. Added `zen cleanup` CLI command with --delete flag (reports by default), --yes/-y flag for skipping confirmation, displays categorized orphan report with counts and paths, confirmation prompt before deletion. All acceptance criteria verified: worktree without linked workflow detected, tmux session "zen_old_task_abc" detected, background actor runs periodic checks, `zen cleanup` lists orphans with confirmation, safe default reports but doesn't auto-delete.
+
+## Step 19: Integration Testing and Polish
+
+### Task 19.1: Create Integration Test Suite - COMPLETED
+- **Files:** tests/integration/mod.rs, tests/integration/fixtures.rs, tests/integration/workflow_e2e.rs, tests/integration/parallel_agents.rs, tests/integration/conflict_resolution.rs, tests/integration/recovery.rs, Cargo.toml
+- **Tests:** 45 integration tests passing
+- **Summary:** Created comprehensive integration test suite for full workflow validation. Added tokio-test dependency and configured integration test in Cargo.toml. Created fixtures module with TestRepo for temp git repositories, test harnesses (SchedulerHarness, HealthMonitorHarness, ConflictResolverHarness), helper functions for creating DAGs (diamond_dag, chain_dag, independent_tasks), and MockClaudeResponder for CI-safe testing. Created workflow_e2e.rs with 10 tests covering happy path, dependencies, empty DAG, single task, failure handling, progress tracking, result collection, large DAG order, and capacity limits. Created parallel_agents.rs with 10 tests covering parallel execution, capacity, completion waves, diamond pattern, task isolation, and event emission. Created conflict_resolution.rs with 7 tests covering clean merge, conflict detection, content extraction, multiple conflicts, and merge result types. Created recovery.rs with 8 tests covering stuck detection, recovery actions (restart, escalate), retry tracker, health config, event types, and healthy agent detection. All tests are CI-compatible (no real Claude API calls). All acceptance criteria verified: `cargo test --test integration` passes all 45 tests, E2E test covers prompt-to-completion workflow, parallel tests verify concurrent execution, conflict tests verify merge handling, recovery tests verify stuck detection, all tests run without Claude API calls.
+
+### Task 19.2: Create Performance Tests - COMPLETED
+- **Files:** tests/integration/performance.rs, tests/integration/mod.rs
+- **Tests:** 60 integration tests passing (45 previous + 15 new performance tests)
+- **Summary:** Created performance test suite verifying system meets performance requirements. Tests cover: TUI render performance (60 FPS requirement - frame time < 16.67ms), scheduler overhead (ready_tasks computation < 10ms for 10+ tasks), memory baseline (data structures for 10 agents < 100MB), and render blocking (lock-free state updates). Key tests: test_render_60fps_with_4_agents verifies frame preparation under threshold; test_scheduler_ready_tasks_overhead and test_scheduler_overhead_50_tasks verify DAG operations are fast; test_memory_baseline_10_agents verifies reasonable struct sizes; test_no_render_blocking and test_state_updates_dont_block_render_thread use async concurrent access to verify no blocking. Additional tests: WorkflowView/AgentView/TaskDAGView calculation performance, topological sort performance, struct size checks. All tests include threshold constants and print metrics for CI visibility. All acceptance criteria verified: 60 FPS render (frame < 16.67ms), scheduler < 10ms, memory baseline reasonable, no render blocking from state updates, CI reports failures if thresholds exceeded.
+
+## Step 20: Documentation and User Guide
+
+### Task 20.1: Create User Documentation - COMPLETED
+- **Commit:** 8b45dae
+- **Files:** docs/user-guide.md, README.md
+- **Summary:** Created comprehensive user documentation. docs/user-guide.md includes: installation instructions with prerequisites (Rust 1.70+, Git, Tmux, Claude Code CLI), quick start guide showing first workflow, detailed workflow phases explanation (Planning, TaskGeneration, Implementation, Merging, Documentation), complete CLI command reference (run, review, accept, reject, status, attach, reset, cleanup) with examples and options, configuration options (trust, agent, update_docs, max_parallel_agents, staging_branch_prefix), and troubleshooting guide covering common issues (workflow not found, accept status errors, staging branch missing, stuck agents, tmux errors, merge conflicts). README.md includes: project description and key features, installation from source, quick start example, complete usage examples for all commands, workflow diagram showing all 5 phases with parallel agents, links to detailed docs. All acceptance criteria verified: quick start provides working example, all CLI commands documented with usage and examples, configuration options explained, troubleshooting covers common errors, README provides clear overview.
+
+### Task 20.2: Create Architecture Documentation - COMPLETED
+- **Commit:** 47bf9a1
+- **Files:** docs/architecture.md, docs/skills-integration.md (new), CONTRIBUTING.md (new)
+- **Tests:** 60 integration tests passing
+- **Summary:** Created architecture documentation for contributors. Updated docs/architecture.md with v2 orchestration system overview including mermaid diagram of Skills Orchestration Layer, component descriptions table for all orchestration modules (SkillsOrchestrator, Scheduler, Resolver, HealthMonitor, etc.), updated thread architecture showing orchestration integration, git-native state management section explaining refs/notes structure, updated dependencies list (clap, petgraph, notify, regex), and enhanced testing section with categories table. Created docs/skills-integration.md documenting skills-driven workflow (PDD → TaskGen → Impl → Merge → Docs), AI-as-Human pattern with code examples showing question answering loop, question detection patterns from detection.rs, and comprehensive guide for adding new skills. Created CONTRIBUTING.md with development setup (prerequisites, build commands), code style guide (naming, errors, documentation, imports), testing requirements with coverage goals, and PR process with checklist and conventional commits format. All acceptance criteria verified: architecture diagram shows clear system structure, component descriptions document purpose and interfaces, skills integration guide explains adding new skills, development setup enables new contributors to build and test, code style conventions are documented.
+

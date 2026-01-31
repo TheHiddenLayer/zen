@@ -436,4 +436,132 @@ impl GitOps {
             }
         }
     }
+
+    /// Merge a branch into main (or master) using git merge --ff-only first, then --no-ff if needed.
+    /// Returns the merge commit hash on success.
+    pub fn merge_branch_to_main(&self, source_branch: &str) -> Result<String> {
+        zlog_debug!(
+            "GitOps::merge_branch_to_main source={}",
+            source_branch
+        );
+
+        // First, check if the source branch exists
+        if !self.branch_exists(source_branch)? {
+            return Err(crate::Error::Validation(format!(
+                "Source branch '{}' does not exist",
+                source_branch
+            )));
+        }
+
+        // Get the main branch name (main or master)
+        let main_branch = self.get_main_branch()?;
+        zlog_debug!("Main branch detected: {}", main_branch);
+
+        // Use git CLI for merge (git2's merge API is complex for this use case)
+        let output = std::process::Command::new("git")
+            .args(["checkout", &main_branch])
+            .current_dir(&self.repo_path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(crate::Error::Validation(format!(
+                "Failed to checkout {}: {}",
+                main_branch,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        // Try fast-forward merge first
+        let output = std::process::Command::new("git")
+            .args(["merge", "--ff-only", source_branch])
+            .current_dir(&self.repo_path)
+            .output()?;
+
+        if !output.status.success() {
+            // Fall back to no-ff merge
+            let output = std::process::Command::new("git")
+                .args([
+                    "merge",
+                    "--no-ff",
+                    "-m",
+                    &format!("Merge workflow branch '{}' into {}", source_branch, main_branch),
+                    source_branch,
+                ])
+                .current_dir(&self.repo_path)
+                .output()?;
+
+            if !output.status.success() {
+                return Err(crate::Error::Validation(format!(
+                    "Failed to merge '{}' into {}: {}",
+                    source_branch,
+                    main_branch,
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+        }
+
+        // Get the resulting commit hash
+        self.head_commit()
+    }
+
+    /// Get the main branch name (main or master).
+    pub fn get_main_branch(&self) -> Result<String> {
+        let repo = self.repo()?;
+
+        // Check for 'main' first, then 'master'
+        for branch_name in &["main", "master"] {
+            if repo
+                .find_branch(branch_name, git2::BranchType::Local)
+                .is_ok()
+            {
+                return Ok((*branch_name).to_string());
+            }
+        }
+
+        // If neither exists, try to get from HEAD
+        if let Ok(head) = repo.head() {
+            if let Some(name) = head.shorthand() {
+                return Ok(name.to_string());
+            }
+        }
+
+        // Default to 'main'
+        Ok("main".to_string())
+    }
+
+    /// List all worktrees matching a prefix pattern.
+    pub fn list_worktrees_with_prefix(&self, prefix: &str) -> Result<Vec<PathBuf>> {
+        let repo = self.repo()?;
+        let worktrees = repo.worktrees()?;
+        let zen_dir = dirs::home_dir()
+            .ok_or(crate::Error::NoHomeDir)?
+            .join(".zen")
+            .join("worktrees");
+
+        let mut paths = Vec::new();
+        for name in worktrees.iter().flatten() {
+            if name.starts_with(prefix) {
+                if let Ok(worktree) = repo.find_worktree(name) {
+                    paths.push(worktree.path().to_path_buf());
+                }
+            }
+        }
+
+        // Also check the worktrees directory for any matching directories
+        if zen_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&zen_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with(prefix) {
+                        paths.push(entry.path());
+                    }
+                }
+            }
+        }
+
+        // Deduplicate
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
 }

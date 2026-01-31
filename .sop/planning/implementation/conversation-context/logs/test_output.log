@@ -1,0 +1,61 @@
+   Compiling zen v0.1.0 (/Users/ubhattachary/.zen/worktrees/improvements-to-zen_1769758773)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.19s
+     Running unittests src/lib.rs (target/debug/deps/zen-9ffc4c352aaf4c45)
+
+running 47 tests
+test orchestration::ai_human::tests::test_ai_human_proxy_is_cloneable ... ok
+test orchestration::ai_human::tests::test_ai_human_proxy_new_stores_prompt ... ok
+test orchestration::ai_human::tests::test_ai_human_proxy_default_model_is_haiku ... ok
+test orchestration::ai_human::tests::test_ai_human_proxy_context_is_empty_initially ... ok
+test orchestration::ai_human::tests::test_answer_question_for_do_you_want ... ok
+test orchestration::ai_human::tests::test_answer_question_for_yes_no_question ... ok
+test orchestration::ai_human::tests::test_answer_question_generic_fallback ... ok
+test orchestration::ai_human::tests::test_answer_question_for_what_question ... ok
+test orchestration::ai_human::tests::test_answer_question_for_database_question ... ok
+test orchestration::ai_human::tests::test_answer_question_for_which_question ... ok
+test orchestration::ai_human::tests::test_answer_question_records_context ... ok
+test orchestration::ai_human::tests::test_answer_question_for_name_question ... ok
+test orchestration::ai_human::tests::test_answer_question_returns_string ... ok
+test orchestration::ai_human::tests::test_conversation_context_clone ... ok
+test orchestration::ai_human::tests::test_conversation_context_default ... ok
+test orchestration::ai_human::tests::test_conversation_context_new ... ok
+test orchestration::ai_human::tests::test_context_includes_previous_database_decision ... ok
+test orchestration::ai_human::tests::test_conversation_context_record ... ok
+test orchestration::ai_human::tests::test_conversation_context_summary_empty ... ok
+test orchestration::ai_human::tests::test_conversation_context_summary_with_history ... ok
+test orchestration::ai_human::tests::test_decision_extraction_approach ... ok
+test orchestration::ai_human::tests::test_decision_extraction_architecture ... ok
+test orchestration::ai_human::tests::test_decision_extraction_call_it ... ok
+test orchestration::ai_human::tests::test_decision_extraction_case_insensitive ... ok
+test orchestration::ai_human::tests::test_decision_extraction_database ... ok
+test orchestration::ai_human::tests::test_decision_extraction_db_shorthand ... ok
+test orchestration::ai_human::tests::test_decision_extraction_design ... ok
+test orchestration::ai_human::tests::test_decision_extraction_framework ... ok
+test orchestration::ai_human::tests::test_decision_extraction_library ... ok
+test orchestration::ai_human::tests::test_decision_extraction_naming ... ok
+test orchestration::ai_human::tests::test_decision_extraction_multiple_decisions ... ok
+test orchestration::ai_human::tests::test_decision_extraction_naming_convention ... ok
+test orchestration::ai_human::tests::test_decision_extraction_pattern ... ok
+test orchestration::ai_human::tests::test_decision_extraction_override ... ok
+test orchestration::ai_human::tests::test_decisions_empty_initially ... ok
+test orchestration::ai_human::tests::test_needs_escalation_case_insensitive ... ok
+test orchestration::ai_human::tests::test_needs_escalation_multiple_valid ... ok
+test orchestration::ai_human::tests::test_needs_escalation_partial_match ... ok
+test orchestration::ai_human::tests::test_needs_escalation_personal_preference ... ok
+test orchestration::ai_human::tests::test_needs_escalation_style_preference ... ok
+test orchestration::ai_human::tests::test_needs_escalation_what_style_want ... ok
+test orchestration::ai_human::tests::test_needs_escalation_which_approach ... ok
+test orchestration::ai_human::tests::test_no_decision_for_unrelated_question ... ok
+test orchestration::ai_human::tests::test_no_escalation_database_question ... ok
+test orchestration::ai_human::tests::test_no_escalation_should_we_add_tests ... ok
+test orchestration::ai_human::tests::test_no_escalation_standard_questions ... ok
+test orchestration::ai_human::tests::test_summary_with_three_qa_pairs ... ok
+
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 258 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/zen-687dbd391b8f6225)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

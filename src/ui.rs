@@ -15,23 +15,44 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Clear, Paragraph},
+    widgets::{Clear, Gauge, Paragraph},
     Frame,
 };
 
-use crate::render::{RenderState, SessionView};
+use crate::agent::AgentStatus;
+use crate::core::task::TaskStatus;
+use crate::render::{AgentView, RenderState, SessionView, TaskDAGView, TaskView, WorkflowView};
 use crate::session::SessionStatus;
 use crate::tea::{InputKind, Mode, Notification, NotificationLevel};
+use crate::workflow::WorkflowStatus;
 
 // Color tokens (selection uses REVERSED modifier to adapt to terminal theme)
 const COLOR_TEXT_DIMMED: Color = Color::Gray;
 const COLOR_TEXT_MUTED: Color = Color::DarkGray;
 const COLOR_SEPARATOR: Color = Color::White;
 
+// Workflow status colors
+const COLOR_WORKFLOW_RUNNING: Color = Color::Green;
+const COLOR_WORKFLOW_COMPLETED: Color = Color::Cyan;
+const COLOR_WORKFLOW_FAILED: Color = Color::Red;
+const COLOR_WORKFLOW_PAUSED: Color = Color::Yellow;
+
+// Phase indicator colors
+const COLOR_PHASE_CURRENT: Color = Color::Cyan;
+const COLOR_PHASE_COMPLETED: Color = Color::Green;
+const COLOR_PHASE_PENDING: Color = Color::DarkGray;
+
 // Status color coding for faster visual parsing (uses terminal palette)
 const COLOR_STATUS_BUSY: Color = Color::Green;
 const COLOR_STATUS_IDLE: Color = Color::Red;
 const COLOR_STATUS_LOCKED: Color = Color::Gray;
+
+// Agent grid status colors
+const COLOR_AGENT_RUNNING: Color = Color::Green;
+const COLOR_AGENT_STUCK: Color = Color::Yellow;
+const COLOR_AGENT_FAILED: Color = Color::Red;
+const COLOR_AGENT_IDLE: Color = Color::Gray;
+const COLOR_AGENT_TERMINATED: Color = Color::Cyan;
 
 // Layout constants
 const HUD_HEIGHT: u16 = 8;
@@ -610,6 +631,590 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Workflow UI Components
+// -----------------------------------------------------------------------------
+
+/// Render workflow header with name and status.
+///
+/// Displays the workflow name and current status when a workflow is active,
+/// or "No active workflow" message when no workflow is running.
+pub fn render_workflow_header(frame: &mut Frame, area: Rect, workflow: Option<&WorkflowView>) {
+    let line = match workflow {
+        Some(wf) => {
+            let status_color = workflow_status_color(&wf.status);
+            let status_label = workflow_status_label(&wf.status);
+
+            Line::from(vec![
+                Span::styled("Workflow: ", Style::default().fg(COLOR_TEXT_DIMMED)),
+                Span::styled(
+                    wf.name.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" [", Style::default().fg(COLOR_TEXT_MUTED)),
+                Span::styled(status_label, Style::default().fg(status_color)),
+                Span::styled("]", Style::default().fg(COLOR_TEXT_MUTED)),
+            ])
+        }
+        None => Line::from(Span::styled(
+            "No active workflow",
+            Style::default().fg(COLOR_TEXT_DIMMED),
+        )),
+    };
+
+    let paragraph = Paragraph::new(line);
+    frame.render_widget(paragraph, area);
+}
+
+/// Render phase progress indicator and progress bar.
+///
+/// Shows all 5 phases with the current phase highlighted, plus a progress bar
+/// showing overall completion percentage.
+pub fn render_phase_progress(frame: &mut Frame, area: Rect, workflow: Option<&WorkflowView>) {
+    let Some(wf) = workflow else {
+        // No workflow - render empty or placeholder
+        return;
+    };
+
+    // Need at least 2 lines: one for phases, one for progress bar
+    if area.height < 2 {
+        return;
+    }
+
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+
+    // Render phase indicator on first line
+    render_phase_indicator(frame, chunks[0], wf);
+
+    // Render progress bar on second line
+    render_progress_bar(frame, chunks[1], wf);
+}
+
+/// Render the 5-phase indicator with current phase highlighted.
+fn render_phase_indicator(frame: &mut Frame, area: Rect, workflow: &WorkflowView) {
+    let phase_names = WorkflowView::phase_names();
+    let current_idx = workflow.current_phase_index();
+
+    let mut spans: Vec<Span> = Vec::new();
+
+    for (i, name) in phase_names.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" → ", Style::default().fg(COLOR_TEXT_MUTED)));
+        }
+
+        let style = if i < current_idx {
+            // Completed phase
+            Style::default().fg(COLOR_PHASE_COMPLETED)
+        } else if i == current_idx && current_idx < 5 {
+            // Current phase (bold + highlighted)
+            Style::default()
+                .fg(COLOR_PHASE_CURRENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            // Pending phase
+            Style::default().fg(COLOR_PHASE_PENDING)
+        };
+
+        spans.push(Span::styled(*name, style));
+    }
+
+    let line = Line::from(spans);
+    let paragraph = Paragraph::new(line);
+    frame.render_widget(paragraph, area);
+}
+
+/// Render progress bar using Gauge widget.
+fn render_progress_bar(frame: &mut Frame, area: Rect, workflow: &WorkflowView) {
+    let percentage = workflow.progress_percentage();
+    let label = format!(
+        "{}% ({}/{})",
+        percentage, workflow.phase_progress.0, workflow.phase_progress.1
+    );
+
+    let gauge = Gauge::default()
+        .gauge_style(Style::default().fg(COLOR_PHASE_CURRENT).bg(Color::DarkGray))
+        .percent(percentage)
+        .label(label);
+
+    frame.render_widget(gauge, area);
+}
+
+/// Get color for workflow status.
+fn workflow_status_color(status: &WorkflowStatus) -> Color {
+    match status {
+        WorkflowStatus::Running => COLOR_WORKFLOW_RUNNING,
+        WorkflowStatus::Completed => COLOR_WORKFLOW_COMPLETED,
+        WorkflowStatus::Failed => COLOR_WORKFLOW_FAILED,
+        WorkflowStatus::Paused => COLOR_WORKFLOW_PAUSED,
+        WorkflowStatus::Pending => COLOR_TEXT_DIMMED,
+        WorkflowStatus::Accepted => Color::Cyan,
+        WorkflowStatus::Rejected => Color::Magenta,
+    }
+}
+
+/// Get display label for workflow status.
+fn workflow_status_label(status: &WorkflowStatus) -> &'static str {
+    match status {
+        WorkflowStatus::Running => "Running",
+        WorkflowStatus::Completed => "Completed",
+        WorkflowStatus::Failed => "Failed",
+        WorkflowStatus::Paused => "Paused",
+        WorkflowStatus::Pending => "Pending",
+        WorkflowStatus::Accepted => "Accepted",
+        WorkflowStatus::Rejected => "Rejected",
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Agent Grid UI Components
+// -----------------------------------------------------------------------------
+
+/// Render a grid of agents for parallel execution monitoring.
+///
+/// Displays agents in a 2x2 or 3x2 grid layout depending on count.
+/// Each cell shows agent status, task name, elapsed time, and output preview.
+pub fn render_agent_grid(
+    frame: &mut Frame,
+    area: Rect,
+    agents: &[AgentView],
+    selected: usize,
+) {
+    if agents.is_empty() {
+        let msg = Line::from(Span::styled(
+            "No active agents",
+            Style::default().fg(COLOR_TEXT_DIMMED),
+        ));
+        let paragraph = Paragraph::new(msg);
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    // Calculate grid layout based on agent count
+    let (rows, cols) = calculate_grid_layout(agents.len());
+
+    // Split area into rows
+    let row_constraints: Vec<Constraint> = (0..rows)
+        .map(|_| Constraint::Ratio(1, rows as u32))
+        .collect();
+    let row_chunks = Layout::vertical(row_constraints).split(area);
+
+    // Render each row
+    let mut agent_idx = 0;
+    for (_row_idx, row_area) in row_chunks.iter().enumerate() {
+        // Split row into columns
+        let col_constraints: Vec<Constraint> = (0..cols)
+            .map(|_| Constraint::Ratio(1, cols as u32))
+            .collect();
+        let col_chunks = Layout::horizontal(col_constraints).split(*row_area);
+
+        for col_area in col_chunks.iter() {
+            if agent_idx < agents.len() {
+                let is_selected = agent_idx == selected;
+                render_agent_cell(frame, *col_area, &agents[agent_idx], is_selected);
+                agent_idx += 1;
+            }
+        }
+
+        // Stop if we've rendered all agents
+        if agent_idx >= agents.len() {
+            break;
+        }
+    }
+}
+
+/// Calculate optimal grid layout (rows, cols) based on agent count.
+///
+/// Returns a (rows, cols) tuple that best fits the agents:
+/// - 1-2 agents: 1 row, 2 cols (1x2)
+/// - 3-4 agents: 2 rows, 2 cols (2x2)
+/// - 5-6 agents: 2 rows, 3 cols (2x3)
+/// - 7-9 agents: 3 rows, 3 cols (3x3)
+fn calculate_grid_layout(agent_count: usize) -> (usize, usize) {
+    match agent_count {
+        0 => (0, 0),
+        1 => (1, 1),
+        2 => (1, 2),
+        3..=4 => (2, 2),
+        5..=6 => (2, 3),
+        7..=9 => (3, 3),
+        _ => {
+            // For larger counts, aim for roughly square grid
+            let cols = (agent_count as f64).sqrt().ceil() as usize;
+            let rows = (agent_count + cols - 1) / cols;
+            (rows, cols)
+        }
+    }
+}
+
+/// Render a single agent cell in the grid.
+fn render_agent_cell(frame: &mut Frame, area: Rect, agent: &AgentView, is_selected: bool) {
+    if area.height < 2 || area.width < 10 {
+        // Not enough space for meaningful content
+        return;
+    }
+
+    // Calculate layout within cell
+    // Line 1: Task name + status indicator
+    // Line 2: Elapsed time
+    // Lines 3+: Output preview (last 3 lines)
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1), // Task name + status
+        Constraint::Length(1), // Elapsed time
+        Constraint::Min(1),    // Output preview
+    ])
+    .split(area);
+
+    // Get status color
+    let status_color = agent_status_color(&agent.status);
+
+    // Selection style
+    let base_style = if is_selected {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+
+    // Render task name + status
+    render_agent_header(frame, chunks[0], agent, status_color, base_style);
+
+    // Render elapsed time
+    render_agent_elapsed(frame, chunks[1], agent, base_style);
+
+    // Render output preview
+    render_agent_output_preview(frame, chunks[2], agent, base_style);
+}
+
+/// Render agent header with task name and status indicator.
+fn render_agent_header(
+    frame: &mut Frame,
+    area: Rect,
+    agent: &AgentView,
+    status_color: Color,
+    base_style: Style,
+) {
+    let status_indicator = match &agent.status {
+        AgentStatus::Running { .. } => "●",  // Filled circle for running
+        AgentStatus::Stuck { .. } => "⚠",   // Warning for stuck
+        AgentStatus::Failed { .. } => "✗",  // X for failed
+        AgentStatus::Idle => "○",            // Empty circle for idle
+        AgentStatus::Terminated => "✓",     // Check for done
+    };
+
+    let available_width = area.width as usize;
+    let status_width = 2; // indicator + space
+    let status_label_width = agent.status_label().len() + 2; // " [label]"
+    let task_width = available_width.saturating_sub(status_width + status_label_width);
+
+    let task_name = truncate(&agent.task_name, task_width);
+
+    let line = Line::from(vec![
+        Span::styled(format!("{} ", status_indicator), Style::default().fg(status_color)),
+        Span::styled(task_name, base_style.add_modifier(Modifier::BOLD)),
+        Span::styled(" [", base_style.fg(COLOR_TEXT_MUTED)),
+        Span::styled(agent.status_label(), base_style.fg(status_color)),
+        Span::styled("]", base_style.fg(COLOR_TEXT_MUTED)),
+    ]);
+
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Render agent elapsed time.
+fn render_agent_elapsed(frame: &mut Frame, area: Rect, agent: &AgentView, base_style: Style) {
+    let elapsed = agent.format_elapsed();
+    let line = Line::from(vec![
+        Span::styled("  ", base_style),
+        Span::styled("Time: ", base_style.fg(COLOR_TEXT_DIMMED)),
+        Span::styled(elapsed, base_style),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Render agent output preview (last few lines).
+fn render_agent_output_preview(
+    frame: &mut Frame,
+    area: Rect,
+    agent: &AgentView,
+    base_style: Style,
+) {
+    let max_lines = area.height as usize;
+    let output_lines = agent.output_lines(max_lines);
+
+    if output_lines.is_empty() {
+        let line = Line::from(Span::styled(
+            "  (no output)",
+            base_style.fg(COLOR_TEXT_MUTED),
+        ));
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    let lines: Vec<Line> = output_lines
+        .iter()
+        .map(|line| {
+            let truncated = truncate(line, area.width.saturating_sub(2) as usize);
+            Line::from(Span::styled(format!("  {}", truncated), base_style.fg(COLOR_TEXT_DIMMED)))
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Get color for agent status.
+fn agent_status_color(status: &AgentStatus) -> Color {
+    match status {
+        AgentStatus::Running { .. } => COLOR_AGENT_RUNNING,
+        AgentStatus::Stuck { .. } => COLOR_AGENT_STUCK,
+        AgentStatus::Failed { .. } => COLOR_AGENT_FAILED,
+        AgentStatus::Idle => COLOR_AGENT_IDLE,
+        AgentStatus::Terminated => COLOR_AGENT_TERMINATED,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// DAG Visualization UI Components
+// -----------------------------------------------------------------------------
+
+// Task status colors for DAG visualization
+const COLOR_TASK_COMPLETED: Color = Color::Green;
+const COLOR_TASK_RUNNING: Color = Color::Cyan;
+const COLOR_TASK_PENDING: Color = Color::DarkGray;
+const COLOR_TASK_READY: Color = Color::Yellow;
+const COLOR_TASK_FAILED: Color = Color::Red;
+const COLOR_TASK_BLOCKED: Color = Color::Magenta;
+
+/// Render the task DAG visualization as ASCII art.
+///
+/// Displays tasks as ASCII boxes with dependency arrows connecting them.
+/// Uses topological layers to arrange tasks horizontally.
+///
+/// Example output:
+/// ```text
+/// [A:done] ──┐
+///            ├──> [C:running]
+/// [B:done] ──┘
+///
+/// [D:pending] ──> [E:pending]
+/// ```
+pub fn render_task_dag(frame: &mut Frame, area: Rect, dag: &TaskDAGView) {
+    if dag.tasks.is_empty() {
+        let msg = Line::from(Span::styled(
+            "No tasks in DAG",
+            Style::default().fg(COLOR_TEXT_DIMMED),
+        ));
+        frame.render_widget(Paragraph::new(msg), area);
+        return;
+    }
+
+    let layers = dag.compute_layers();
+    let ascii_lines = render_dag_ascii(dag, &layers, area.width as usize);
+
+    let text: Vec<Line> = ascii_lines
+        .into_iter()
+        .take(area.height as usize)
+        .collect();
+
+    frame.render_widget(Paragraph::new(text), area);
+}
+
+/// Render DAG as ASCII lines with task boxes and arrows.
+fn render_dag_ascii(dag: &TaskDAGView, layers: &[Vec<usize>], max_width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Calculate positions for each task
+    let positions = calculate_task_positions(dag, layers);
+
+    // Track which layer each task is in
+    let mut task_layer: Vec<usize> = vec![0; dag.tasks.len()];
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        for &task_idx in layer {
+            task_layer[task_idx] = layer_idx;
+        }
+    }
+
+    // Render each layer
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        let is_last_layer = layer_idx == layers.len() - 1;
+
+        // Render tasks in this layer (may span multiple lines)
+        let layer_lines = render_layer_boxes(dag, layer, &positions, max_width);
+        lines.extend(layer_lines);
+
+        // Render arrows to next layer (if not last layer)
+        if !is_last_layer {
+            let arrow_lines = render_layer_arrows(dag, layer, &task_layer, layer_idx, &positions);
+            lines.extend(arrow_lines);
+        }
+    }
+
+    lines
+}
+
+/// Calculate task positions (row offset within layer) for layout.
+fn calculate_task_positions(_dag: &TaskDAGView, layers: &[Vec<usize>]) -> Vec<usize> {
+    let mut positions = vec![0; layers.iter().map(|l| l.iter().max().copied().unwrap_or(0) + 1).max().unwrap_or(0)];
+
+    for layer in layers {
+        for (row, &task_idx) in layer.iter().enumerate() {
+            if task_idx < positions.len() {
+                positions[task_idx] = row;
+            } else {
+                positions.resize(task_idx + 1, 0);
+                positions[task_idx] = row;
+            }
+        }
+    }
+
+    positions
+}
+
+/// Render task boxes for a single layer.
+fn render_layer_boxes(
+    dag: &TaskDAGView,
+    layer: &[usize],
+    _positions: &[usize],
+    max_width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    for &task_idx in layer {
+        let task = &dag.tasks[task_idx];
+        let box_line = render_task_box(task, max_width);
+        lines.push(box_line);
+    }
+
+    lines
+}
+
+/// Render a single task as an ASCII box.
+fn render_task_box(task: &TaskView, max_width: usize) -> Line<'static> {
+    let status_label = task.status_label();
+    let color = task_status_color(&task.status);
+
+    // Format: [name:status]
+    // Truncate name if needed to fit in max_width
+    let max_name_len = max_width.saturating_sub(status_label.len() + 4); // 4 for [, :, ], space
+    let name = if task.name.len() > max_name_len {
+        format!("{}~", &task.name[..max_name_len.saturating_sub(1)])
+    } else {
+        task.name.clone()
+    };
+
+    let box_text = format!("[{}:{}]", name, status_label);
+
+    Line::from(vec![Span::styled(box_text, Style::default().fg(color))])
+}
+
+/// Render arrows connecting a layer to subsequent layers.
+fn render_layer_arrows(
+    dag: &TaskDAGView,
+    layer: &[usize],
+    task_layer: &[usize],
+    current_layer_idx: usize,
+    _positions: &[usize],
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Collect edges from this layer to the next
+    let mut has_edges = false;
+    for &task_idx in layer {
+        let outgoing = dag.outgoing_edges(task_idx);
+        for &to_idx in &outgoing {
+            // Only show arrows to the immediate next layer
+            if task_layer[to_idx] == current_layer_idx + 1 {
+                has_edges = true;
+                break;
+            }
+        }
+        if has_edges {
+            break;
+        }
+    }
+
+    if has_edges {
+        // Simple arrow representation
+        let mut spans: Vec<Span<'static>> = Vec::new();
+
+        // Collect all edges from this layer
+        let mut edge_targets: Vec<usize> = Vec::new();
+        for &task_idx in layer {
+            for &to_idx in &dag.outgoing_edges(task_idx) {
+                if task_layer[to_idx] == current_layer_idx + 1 && !edge_targets.contains(&to_idx) {
+                    edge_targets.push(to_idx);
+                }
+            }
+        }
+
+        if layer.len() == 1 && edge_targets.len() == 1 {
+            // Simple single arrow: ──>
+            spans.push(Span::styled("  ──> ", Style::default().fg(COLOR_TEXT_MUTED)));
+        } else if layer.len() > 1 && edge_targets.len() == 1 {
+            // Multiple sources to single target: merge
+            spans.push(Span::styled("  ├──> ", Style::default().fg(COLOR_TEXT_MUTED)));
+        } else if layer.len() == 1 && edge_targets.len() > 1 {
+            // Single source to multiple targets: fan out
+            spans.push(Span::styled("  ┬──> ", Style::default().fg(COLOR_TEXT_MUTED)));
+        } else {
+            // Complex case: multiple to multiple
+            spans.push(Span::styled("  │ ", Style::default().fg(COLOR_TEXT_MUTED)));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    lines
+}
+
+/// Get color for task status.
+fn task_status_color(status: &TaskStatus) -> Color {
+    match status {
+        TaskStatus::Completed => COLOR_TASK_COMPLETED,
+        TaskStatus::Running => COLOR_TASK_RUNNING,
+        TaskStatus::Ready => COLOR_TASK_READY,
+        TaskStatus::Pending => COLOR_TASK_PENDING,
+        TaskStatus::Failed { .. } => COLOR_TASK_FAILED,
+        TaskStatus::Blocked { .. } => COLOR_TASK_BLOCKED,
+        TaskStatus::Cancelled { .. } => COLOR_TEXT_DIMMED,
+    }
+}
+
+/// Generate ASCII representation of DAG for text output.
+///
+/// Returns a vector of strings representing the DAG,
+/// useful for testing and debugging.
+pub fn dag_to_ascii_string(dag: &TaskDAGView) -> Vec<String> {
+    let layers = dag.compute_layers();
+    let mut result: Vec<String> = Vec::new();
+
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        // Task boxes
+        for &task_idx in layer {
+            let task = &dag.tasks[task_idx];
+            result.push(format!("[{}:{}]", task.name, task.status_label()));
+        }
+
+        // Arrows to next layer
+        if layer_idx < layers.len() - 1 {
+            let mut has_edges = false;
+            for &task_idx in layer {
+                if !dag.outgoing_edges(task_idx).is_empty() {
+                    has_edges = true;
+                    break;
+                }
+            }
+            if has_edges {
+                if layer.len() == 1 {
+                    result.push("  ──>".to_string());
+                } else {
+                    result.push("  ├──>".to_string());
+                }
+            }
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,5 +1248,423 @@ mod tests {
             format_base_display("jsmith/dev", "c453da123456789"),
             "jsmith/dev @ c453da1"
         );
+    }
+
+    // Workflow UI Component tests
+
+    use crate::workflow::{WorkflowId, WorkflowPhase};
+
+    #[test]
+    fn test_workflow_status_color_running() {
+        assert_eq!(workflow_status_color(&WorkflowStatus::Running), COLOR_WORKFLOW_RUNNING);
+    }
+
+    #[test]
+    fn test_workflow_status_color_completed() {
+        assert_eq!(workflow_status_color(&WorkflowStatus::Completed), COLOR_WORKFLOW_COMPLETED);
+    }
+
+    #[test]
+    fn test_workflow_status_color_failed() {
+        assert_eq!(workflow_status_color(&WorkflowStatus::Failed), COLOR_WORKFLOW_FAILED);
+    }
+
+    #[test]
+    fn test_workflow_status_color_paused() {
+        assert_eq!(workflow_status_color(&WorkflowStatus::Paused), COLOR_WORKFLOW_PAUSED);
+    }
+
+    #[test]
+    fn test_workflow_status_color_pending() {
+        assert_eq!(workflow_status_color(&WorkflowStatus::Pending), COLOR_TEXT_DIMMED);
+    }
+
+    #[test]
+    fn test_workflow_status_label_all_statuses() {
+        assert_eq!(workflow_status_label(&WorkflowStatus::Running), "Running");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Completed), "Completed");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Failed), "Failed");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Paused), "Paused");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Pending), "Pending");
+    }
+
+    #[test]
+    fn test_workflow_view_for_implementation_phase() {
+        // Given workflow in Implementation phase
+        let view = WorkflowView::new(
+            WorkflowId::new(),
+            "build-auth".to_string(),
+            WorkflowPhase::Implementation,
+            WorkflowStatus::Running,
+        );
+
+        // Then current_phase_index returns 2 (Implementation is third phase)
+        assert_eq!(view.current_phase_index(), 2);
+
+        // And phase_progress shows 2 completed phases
+        assert_eq!(view.phase_progress, (2, 5));
+    }
+
+    #[test]
+    fn test_workflow_view_progress_bar_60_percent() {
+        // Given 3 of 5 phases complete (Merging phase)
+        let view = WorkflowView::new(
+            WorkflowId::new(),
+            "test".to_string(),
+            WorkflowPhase::Merging,
+            WorkflowStatus::Running,
+        );
+
+        // Then progress bar shows 60%
+        assert_eq!(view.progress_percentage(), 60);
+    }
+
+    #[test]
+    fn test_workflow_view_phase_names_ordered() {
+        let names = WorkflowView::phase_names();
+        // Verify phase names are in correct order
+        assert_eq!(names[0], "Planning");
+        assert_eq!(names[1], "TaskGen");
+        assert_eq!(names[2], "Impl");
+        assert_eq!(names[3], "Merge");
+        assert_eq!(names[4], "Docs");
+    }
+
+    #[test]
+    fn test_workflow_view_all_phase_indices() {
+        // Test that current_phase_index returns correct index for each phase
+        let test_cases = [
+            (WorkflowPhase::Planning, 0),
+            (WorkflowPhase::TaskGeneration, 1),
+            (WorkflowPhase::Implementation, 2),
+            (WorkflowPhase::Merging, 3),
+            (WorkflowPhase::Documentation, 4),
+            (WorkflowPhase::Complete, 5),
+        ];
+
+        for (phase, expected_idx) in test_cases {
+            let view = WorkflowView::new(
+                WorkflowId::new(),
+                "test".to_string(),
+                phase,
+                WorkflowStatus::Running,
+            );
+            assert_eq!(
+                view.current_phase_index(),
+                expected_idx,
+                "Phase {:?} should have index {}",
+                phase,
+                expected_idx
+            );
+        }
+    }
+
+    // Agent Grid UI Component tests
+
+    use crate::agent::AgentId;
+    use crate::workflow::TaskId;
+    use std::time::Duration;
+
+    #[allow(dead_code)]
+    fn create_test_agent(name: &str, status: AgentStatus, elapsed_secs: u64) -> AgentView {
+        AgentView::new(
+            AgentId::new(),
+            name.to_string(),
+            status,
+            Duration::from_secs(elapsed_secs),
+            "Line 1\nLine 2\nLine 3".to_string(),
+        )
+    }
+
+    #[test]
+    fn test_grid_layout_4_agents_2x2() {
+        // Given 4 active agents
+        // When calculate_grid_layout is called
+        // Then 2x2 grid is returned
+        let (rows, cols) = calculate_grid_layout(4);
+        assert_eq!(rows, 2);
+        assert_eq!(cols, 2);
+    }
+
+    #[test]
+    fn test_grid_layout_1_agent() {
+        let (rows, cols) = calculate_grid_layout(1);
+        assert_eq!(rows, 1);
+        assert_eq!(cols, 1);
+    }
+
+    #[test]
+    fn test_grid_layout_2_agents() {
+        let (rows, cols) = calculate_grid_layout(2);
+        assert_eq!(rows, 1);
+        assert_eq!(cols, 2);
+    }
+
+    #[test]
+    fn test_grid_layout_3_agents() {
+        let (rows, cols) = calculate_grid_layout(3);
+        assert_eq!(rows, 2);
+        assert_eq!(cols, 2);
+    }
+
+    #[test]
+    fn test_grid_layout_6_agents_2x3() {
+        // Given 6 agents
+        // When calculate_grid_layout is called
+        // Then 2x3 grid is returned
+        let (rows, cols) = calculate_grid_layout(6);
+        assert_eq!(rows, 2);
+        assert_eq!(cols, 3);
+    }
+
+    #[test]
+    fn test_grid_layout_0_agents() {
+        let (rows, cols) = calculate_grid_layout(0);
+        assert_eq!(rows, 0);
+        assert_eq!(cols, 0);
+    }
+
+    #[test]
+    fn test_agent_status_color_running() {
+        // Given agent in Running status
+        // When rendered
+        // Then green indicator is shown
+        let task_id = TaskId::new();
+        let status = AgentStatus::Running { task_id };
+        assert_eq!(agent_status_color(&status), COLOR_AGENT_RUNNING);
+    }
+
+    #[test]
+    fn test_agent_status_color_stuck() {
+        let status = AgentStatus::Stuck {
+            since: std::time::Instant::now(),
+            reason: "timeout".to_string(),
+        };
+        assert_eq!(agent_status_color(&status), COLOR_AGENT_STUCK);
+    }
+
+    #[test]
+    fn test_agent_status_color_failed() {
+        let status = AgentStatus::Failed {
+            error: "process exited".to_string(),
+        };
+        assert_eq!(agent_status_color(&status), COLOR_AGENT_FAILED);
+    }
+
+    #[test]
+    fn test_agent_status_color_idle() {
+        assert_eq!(agent_status_color(&AgentStatus::Idle), COLOR_AGENT_IDLE);
+    }
+
+    #[test]
+    fn test_agent_status_color_terminated() {
+        assert_eq!(agent_status_color(&AgentStatus::Terminated), COLOR_AGENT_TERMINATED);
+    }
+
+    #[test]
+    fn test_render_state_default_agents_empty() {
+        let state = RenderState::default();
+        assert!(state.agents.is_empty());
+        assert_eq!(state.selected_agent, 0);
+    }
+
+    // DAG Visualization tests
+
+    #[test]
+    fn test_task_status_color_completed() {
+        assert_eq!(task_status_color(&TaskStatus::Completed), COLOR_TASK_COMPLETED);
+    }
+
+    #[test]
+    fn test_task_status_color_running() {
+        assert_eq!(task_status_color(&TaskStatus::Running), COLOR_TASK_RUNNING);
+    }
+
+    #[test]
+    fn test_task_status_color_pending() {
+        assert_eq!(task_status_color(&TaskStatus::Pending), COLOR_TASK_PENDING);
+    }
+
+    #[test]
+    fn test_task_status_color_ready() {
+        assert_eq!(task_status_color(&TaskStatus::Ready), COLOR_TASK_READY);
+    }
+
+    #[test]
+    fn test_task_status_color_failed() {
+        let status = TaskStatus::Failed { error: "error".to_string() };
+        assert_eq!(task_status_color(&status), COLOR_TASK_FAILED);
+    }
+
+    #[test]
+    fn test_task_status_color_blocked() {
+        let status = TaskStatus::Blocked { reason: "waiting".to_string() };
+        assert_eq!(task_status_color(&status), COLOR_TASK_BLOCKED);
+    }
+
+    #[test]
+    fn test_task_status_color_cancelled() {
+        let status = TaskStatus::Cancelled { reason: "replanned".to_string() };
+        assert_eq!(task_status_color(&status), COLOR_TEXT_DIMMED);
+    }
+
+    #[test]
+    fn test_dag_to_ascii_5_tasks() {
+        // Given 5 tasks in DAG
+        let mut dag = TaskDAGView::new();
+        dag.add_task(TaskView::new("task-1".to_string(), TaskStatus::Completed));
+        dag.add_task(TaskView::new("task-2".to_string(), TaskStatus::Completed));
+        dag.add_task(TaskView::new("task-3".to_string(), TaskStatus::Running));
+        dag.add_task(TaskView::new("task-4".to_string(), TaskStatus::Pending));
+        dag.add_task(TaskView::new("task-5".to_string(), TaskStatus::Pending));
+
+        // When rendered to ASCII
+        let ascii = dag_to_ascii_string(&dag);
+
+        // Then 5 ASCII boxes are displayed with task names
+        let task_boxes: Vec<_> = ascii.iter()
+            .filter(|line| line.starts_with('[') && line.ends_with(']'))
+            .collect();
+        assert_eq!(task_boxes.len(), 5, "Should have 5 task boxes");
+
+        // Verify all task names are present
+        assert!(ascii.iter().any(|s| s.contains("task-1")));
+        assert!(ascii.iter().any(|s| s.contains("task-2")));
+        assert!(ascii.iter().any(|s| s.contains("task-3")));
+        assert!(ascii.iter().any(|s| s.contains("task-4")));
+        assert!(ascii.iter().any(|s| s.contains("task-5")));
+    }
+
+    #[test]
+    fn test_dag_to_ascii_dependency_arrow() {
+        // Given A->C dependency
+        let mut dag = TaskDAGView::new();
+        let a_idx = dag.add_task(TaskView::new("A".to_string(), TaskStatus::Completed));
+        let c_idx = dag.add_task(TaskView::new("C".to_string(), TaskStatus::Running));
+        dag.add_edge(a_idx, c_idx);
+
+        // When rendered to ASCII
+        let ascii = dag_to_ascii_string(&dag);
+
+        // Then arrow connects A box to C box (arrow line present)
+        assert!(ascii.iter().any(|s| s.contains("──>")), "Should have arrow: {:?}", ascii);
+    }
+
+    #[test]
+    fn test_dag_to_ascii_completed_status() {
+        // Given completed task A
+        let mut dag = TaskDAGView::new();
+        dag.add_task(TaskView::new("A".to_string(), TaskStatus::Completed));
+
+        // When rendered to ASCII
+        let ascii = dag_to_ascii_string(&dag);
+
+        // Then A's box shows done status
+        assert!(ascii.iter().any(|s| s.contains("[A:done]")), "Should show A:done, got: {:?}", ascii);
+    }
+
+    #[test]
+    fn test_dag_to_ascii_running_status() {
+        // Given running task
+        let mut dag = TaskDAGView::new();
+        dag.add_task(TaskView::new("B".to_string(), TaskStatus::Running));
+
+        let ascii = dag_to_ascii_string(&dag);
+        assert!(ascii.iter().any(|s| s.contains("[B:running]")));
+    }
+
+    #[test]
+    fn test_dag_to_ascii_pending_status() {
+        // Given pending task
+        let mut dag = TaskDAGView::new();
+        dag.add_task(TaskView::new("C".to_string(), TaskStatus::Pending));
+
+        let ascii = dag_to_ascii_string(&dag);
+        assert!(ascii.iter().any(|s| s.contains("[C:pending]")));
+    }
+
+    #[test]
+    fn test_dag_to_ascii_linear_chain() {
+        // A -> B -> C
+        let mut dag = TaskDAGView::new();
+        dag.add_task(TaskView::new("A".to_string(), TaskStatus::Completed));
+        dag.add_task(TaskView::new("B".to_string(), TaskStatus::Running));
+        dag.add_task(TaskView::new("C".to_string(), TaskStatus::Pending));
+        dag.add_edge(0, 1);
+        dag.add_edge(1, 2);
+
+        let ascii = dag_to_ascii_string(&dag);
+
+        // All three tasks should be present
+        assert!(ascii.iter().any(|s| s.contains("[A:done]")));
+        assert!(ascii.iter().any(|s| s.contains("[B:running]")));
+        assert!(ascii.iter().any(|s| s.contains("[C:pending]")));
+
+        // Should have arrows
+        let arrow_count = ascii.iter().filter(|s| s.contains("──>")).count();
+        assert!(arrow_count >= 2, "Should have at least 2 arrows for chain");
+    }
+
+    #[test]
+    fn test_dag_to_ascii_diamond_pattern() {
+        // A -> B, A -> C, B -> D, C -> D
+        let mut dag = TaskDAGView::new();
+        dag.add_task(TaskView::new("A".to_string(), TaskStatus::Completed));
+        dag.add_task(TaskView::new("B".to_string(), TaskStatus::Running));
+        dag.add_task(TaskView::new("C".to_string(), TaskStatus::Running));
+        dag.add_task(TaskView::new("D".to_string(), TaskStatus::Pending));
+        dag.add_edge(0, 1);
+        dag.add_edge(0, 2);
+        dag.add_edge(1, 3);
+        dag.add_edge(2, 3);
+
+        let ascii = dag_to_ascii_string(&dag);
+
+        // All four tasks should be present
+        assert!(ascii.iter().any(|s| s.contains("[A:done]")));
+        assert!(ascii.iter().any(|s| s.contains("[B:running]")));
+        assert!(ascii.iter().any(|s| s.contains("[C:running]")));
+        assert!(ascii.iter().any(|s| s.contains("[D:pending]")));
+    }
+
+    #[test]
+    fn test_dag_to_ascii_complex_10_tasks() {
+        // Given DAG with 10 tasks and multiple paths
+        let mut dag = TaskDAGView::new();
+        for i in 0..10 {
+            let status = match i {
+                0..=2 => TaskStatus::Completed,
+                3..=5 => TaskStatus::Running,
+                _ => TaskStatus::Pending,
+            };
+            dag.add_task(TaskView::new(format!("task-{}", i), status));
+        }
+        // Add some dependencies
+        dag.add_edge(0, 3);
+        dag.add_edge(1, 4);
+        dag.add_edge(2, 5);
+        dag.add_edge(3, 6);
+        dag.add_edge(4, 7);
+        dag.add_edge(5, 8);
+        dag.add_edge(6, 9);
+        dag.add_edge(7, 9);
+        dag.add_edge(8, 9);
+
+        // When rendered to ASCII
+        let ascii = dag_to_ascii_string(&dag);
+
+        // Then all dependencies are visible (may scroll)
+        // All 10 tasks should be present
+        let task_boxes: Vec<_> = ascii.iter()
+            .filter(|line| line.starts_with('[') && line.ends_with(']'))
+            .collect();
+        assert_eq!(task_boxes.len(), 10, "Should have 10 task boxes: {:?}", ascii);
+    }
+
+    #[test]
+    fn test_render_state_default_dag_none() {
+        let state = RenderState::default();
+        assert!(state.dag.is_none());
+        assert!(!state.show_dag);
     }
 }

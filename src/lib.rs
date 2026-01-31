@@ -1,11 +1,18 @@
 pub mod agent;
+pub mod cleanup;
 pub mod config;
+pub mod core;
 pub mod error;
 pub mod git;
+pub mod git_notes;
+pub mod git_refs;
 pub mod log;
+pub mod orchestration;
 pub mod session;
+pub mod state;
 pub mod tmux;
 pub mod util;
+pub mod workflow;
 
 // Decoupled game loop architecture
 pub mod actors;
@@ -153,6 +160,11 @@ mod architecture_tests {
             notification: None,
             show_keymap: false,
             trust_enabled: false,
+            workflow: None,
+            agents: vec![],
+            selected_agent: 0,
+            dag: None,
+            show_dag: false,
         };
 
         let start = Instant::now();
