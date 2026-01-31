@@ -74,6 +74,11 @@ pub enum TaskStatus {
         /// Reason why the task is blocked.
         reason: String,
     },
+    /// Task was cancelled during replanning.
+    Cancelled {
+        /// Reason why the task was cancelled.
+        reason: String,
+    },
 }
 
 impl Default for TaskStatus {
@@ -91,6 +96,7 @@ impl std::fmt::Display for TaskStatus {
             TaskStatus::Completed => write!(f, "completed"),
             TaskStatus::Failed { error } => write!(f, "failed: {}", error),
             TaskStatus::Blocked { reason } => write!(f, "blocked: {}", reason),
+            TaskStatus::Cancelled { reason } => write!(f, "cancelled: {}", reason),
         }
     }
 }
@@ -188,6 +194,17 @@ impl Task {
         };
     }
 
+    /// Mark the task as cancelled.
+    ///
+    /// Transitions status to Cancelled with a reason.
+    /// Used during replanning when a task is removed from the plan.
+    pub fn cancel(&mut self, reason: &str) {
+        self.status = TaskStatus::Cancelled {
+            reason: reason.to_string(),
+        };
+        self.completed_at = Some(Utc::now());
+    }
+
     /// Assign an agent to this task.
     pub fn assign_agent(&mut self, agent_id: AgentId) {
         self.agent_id = Some(agent_id);
@@ -204,11 +221,11 @@ impl Task {
         self.commit_hash = Some(hash.to_string());
     }
 
-    /// Check if the task is in a terminal state (Completed or Failed).
+    /// Check if the task is in a terminal state (Completed, Failed, or Cancelled).
     pub fn is_finished(&self) -> bool {
         matches!(
             self.status,
-            TaskStatus::Completed | TaskStatus::Failed { .. }
+            TaskStatus::Completed | TaskStatus::Failed { .. } | TaskStatus::Cancelled { .. }
         )
     }
 
@@ -632,5 +649,71 @@ mod tests {
         let debug = format!("{:?}", task);
         assert!(debug.contains("Task"));
         assert!(debug.contains("test-task"));
+    }
+
+    // Cancelled status tests
+
+    #[test]
+    fn test_task_status_display_cancelled() {
+        let status = TaskStatus::Cancelled {
+            reason: "removed from plan".to_string(),
+        };
+        assert_eq!(format!("{}", status), "cancelled: removed from plan");
+    }
+
+    #[test]
+    fn test_task_status_serialization_cancelled() {
+        let status = TaskStatus::Cancelled {
+            reason: "plan changed".to_string(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("cancelled"));
+        assert!(json.contains("plan changed"));
+        let parsed: TaskStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(status, parsed);
+    }
+
+    #[test]
+    fn test_task_status_cancelled_stores_reason() {
+        let reason = "task removed during replanning".to_string();
+        let status = TaskStatus::Cancelled {
+            reason: reason.clone(),
+        };
+        if let TaskStatus::Cancelled { reason: r } = status {
+            assert_eq!(r, reason);
+        } else {
+            panic!("Expected Cancelled variant");
+        }
+    }
+
+    #[test]
+    fn test_task_cancel() {
+        let mut task = Task::new("test-task", "Test description");
+
+        task.cancel("removed from plan");
+
+        assert!(matches!(task.status, TaskStatus::Cancelled { reason } if reason == "removed from plan"));
+        assert!(task.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_task_is_finished_on_cancelled() {
+        let mut task = Task::new("test-task", "Test description");
+        task.cancel("cancelled");
+
+        assert!(task.is_finished());
+    }
+
+    #[test]
+    fn test_task_lifecycle_pending_to_cancelled() {
+        let mut task = Task::new("test-task", "Test description");
+
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert!(task.completed_at.is_none());
+
+        task.cancel("no longer needed");
+
+        assert!(matches!(task.status, TaskStatus::Cancelled { .. }));
+        assert!(task.completed_at.is_some());
     }
 }

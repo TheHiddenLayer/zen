@@ -204,6 +204,10 @@ impl Model {
             show_keymap: self.show_keymap,
             trust_enabled: self.config.trust,
             workflow: None, // TODO: populate from workflow state when available
+            agents: Vec::new(), // TODO: populate from agent pool when available
+            selected_agent: 0,
+            dag: None, // TODO: populate from scheduler DAG when available
+            show_dag: false,
         }
     }
 }

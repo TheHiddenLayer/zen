@@ -98,6 +98,10 @@ pub enum WorkflowStatus {
     Completed,
     /// Workflow failed with error
     Failed,
+    /// Workflow accepted and merged to main
+    Accepted,
+    /// Workflow rejected and discarded
+    Rejected,
 }
 
 impl std::fmt::Display for WorkflowStatus {
@@ -108,6 +112,8 @@ impl std::fmt::Display for WorkflowStatus {
             WorkflowStatus::Paused => write!(f, "paused"),
             WorkflowStatus::Completed => write!(f, "completed"),
             WorkflowStatus::Failed => write!(f, "failed"),
+            WorkflowStatus::Accepted => write!(f, "accepted"),
+            WorkflowStatus::Rejected => write!(f, "rejected"),
         }
     }
 }
@@ -248,6 +254,20 @@ impl Workflow {
     pub fn fail(&mut self) {
         self.status = WorkflowStatus::Failed;
         self.completed_at = Some(Utc::now());
+    }
+
+    /// Mark the workflow as accepted (merged to main).
+    ///
+    /// Sets status to Accepted. Should only be called after workflow is Completed.
+    pub fn accept(&mut self) {
+        self.status = WorkflowStatus::Accepted;
+    }
+
+    /// Mark the workflow as rejected (discarded).
+    ///
+    /// Sets status to Rejected. Can be called on any completed or failed workflow.
+    pub fn reject(&mut self) {
+        self.status = WorkflowStatus::Rejected;
     }
 }
 
@@ -436,6 +456,16 @@ mod tests {
     }
 
     #[test]
+    fn test_workflow_status_display_accepted() {
+        assert_eq!(format!("{}", WorkflowStatus::Accepted), "accepted");
+    }
+
+    #[test]
+    fn test_workflow_status_display_rejected() {
+        assert_eq!(format!("{}", WorkflowStatus::Rejected), "rejected");
+    }
+
+    #[test]
     fn test_workflow_status_serialization() {
         let statuses = [
             WorkflowStatus::Pending,
@@ -443,6 +473,8 @@ mod tests {
             WorkflowStatus::Paused,
             WorkflowStatus::Completed,
             WorkflowStatus::Failed,
+            WorkflowStatus::Accepted,
+            WorkflowStatus::Rejected,
         ];
 
         for status in statuses {
@@ -459,6 +491,8 @@ mod tests {
         assert_eq!(serde_json::to_string(&WorkflowStatus::Paused).unwrap(), r#""paused""#);
         assert_eq!(serde_json::to_string(&WorkflowStatus::Completed).unwrap(), r#""completed""#);
         assert_eq!(serde_json::to_string(&WorkflowStatus::Failed).unwrap(), r#""failed""#);
+        assert_eq!(serde_json::to_string(&WorkflowStatus::Accepted).unwrap(), r#""accepted""#);
+        assert_eq!(serde_json::to_string(&WorkflowStatus::Rejected).unwrap(), r#""rejected""#);
     }
 
     // TaskId tests
@@ -598,6 +632,43 @@ mod tests {
 
         assert_eq!(workflow.status, WorkflowStatus::Failed);
         assert!(workflow.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_workflow_accept() {
+        let config = WorkflowConfig::default();
+        let mut workflow = Workflow::new("test prompt", config);
+        workflow.start();
+        workflow.complete();
+
+        workflow.accept();
+
+        assert_eq!(workflow.status, WorkflowStatus::Accepted);
+    }
+
+    #[test]
+    fn test_workflow_reject() {
+        let config = WorkflowConfig::default();
+        let mut workflow = Workflow::new("test prompt", config);
+        workflow.start();
+        workflow.complete();
+
+        workflow.reject();
+
+        assert_eq!(workflow.status, WorkflowStatus::Rejected);
+    }
+
+    #[test]
+    fn test_workflow_reject_after_fail() {
+        let config = WorkflowConfig::default();
+        let mut workflow = Workflow::new("test prompt", config);
+        workflow.start();
+        workflow.fail();
+
+        // Can reject a failed workflow
+        workflow.reject();
+
+        assert_eq!(workflow.status, WorkflowStatus::Rejected);
     }
 
     #[test]

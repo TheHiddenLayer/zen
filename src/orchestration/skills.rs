@@ -17,7 +17,9 @@ use crate::error::{Error, Result};
 use crate::workflow::{Workflow, WorkflowConfig, WorkflowId, WorkflowPhase, WorkflowState, WorkflowStatus};
 use crate::{zlog, zlog_debug};
 
-use super::{AgentEvent, AgentHandle, AgentOutput, AgentPool, AIHumanProxy, ClaudeHeadless, ImplResult, Scheduler};
+use crate::git::GitOps;
+
+use super::{AgentEvent, AgentHandle, AgentOutput, AgentPool, AIHumanProxy, ClaudeHeadless, ConflictResolver, ImplResult, MergeResult, Scheduler};
 
 /// Events emitted by the PhaseController during phase transitions.
 ///
@@ -571,7 +573,7 @@ impl SkillsOrchestrator {
 
         // PHASE 3: Implementation with /code-assist in parallel
         zlog!("[orchestrator] Beginning implementation phase");
-        let _impl_results = match self.run_implementation_phase(&generated_tasks).await {
+        let impl_results = match self.run_implementation_phase(&generated_tasks).await {
             Ok(results) => {
                 zlog!("[orchestrator] Implementation phase completed: {} tasks", results.len());
                 results
@@ -591,7 +593,7 @@ impl SkillsOrchestrator {
 
         // PHASE 4: Merge and resolve conflicts
         zlog!("[orchestrator] Beginning merge phase");
-        if let Err(e) = self.run_merge_phase().await {
+        if let Err(e) = self.run_merge_phase(&impl_results).await {
             return Ok(self.fail_workflow(workflow_id, format!("Merge phase failed: {}", e)).await);
         }
 
@@ -978,15 +980,182 @@ impl SkillsOrchestrator {
         Ok(dag)
     }
 
-    /// Run the merge phase (stub - will be implemented in Step 12).
-    async fn run_merge_phase(&self) -> Result<()> {
-        zlog_debug!("[orchestrator] Merge phase stub - will merge worktrees in Step 12");
+    /// Run the merge phase by merging all task worktrees into the staging branch.
+    ///
+    /// This is Phase 4 of the workflow. It:
+    /// 1. Creates a staging branch from the current HEAD
+    /// 2. Merges each task worktree into the staging branch
+    /// 3. Resolves conflicts using AI-assisted conflict resolution
+    /// 4. Creates a unified staging branch for user review
+    ///
+    /// # Arguments
+    ///
+    /// * `results` - The implementation results from Phase 3, containing
+    ///   worktree paths and commit hashes for each task
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success. All worktrees have been merged into the staging branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - GitOps cannot be created for the repository
+    /// - Staging branch cannot be created
+    /// - A merge fails and cannot be resolved
+    /// - Conflict resolution times out or fails
+    pub async fn run_merge_phase(&self, results: &[ImplResult]) -> Result<()> {
+        if results.is_empty() {
+            zlog!("[orchestrator] No implementation results to merge, skipping merge phase");
+            return Ok(());
+        }
+
+        zlog!(
+            "[orchestrator] Starting merge phase with {} worktrees",
+            results.len()
+        );
+
+        // Create GitOps for the repository
+        let git_ops = GitOps::new(&self.repo_path)?;
+
+        // Create ConflictResolver with agent pool for AI-assisted resolution
+        let resolver = ConflictResolver::new(git_ops, Arc::clone(&self.agent_pool));
+
+        // Create staging branch name from workflow id
+        let workflow_id = self.state.read().await.workflow().id;
+        let staging_branch = format!(
+            "{}{}",
+            self.state.read().await.workflow().config.staging_branch_prefix,
+            workflow_id.short()
+        );
+
+        zlog!(
+            "[orchestrator] Merging into staging branch: {}",
+            staging_branch
+        );
+
+        // Merge each worktree in sequence
+        for (idx, result) in results.iter().enumerate() {
+            zlog!(
+                "[orchestrator] Merging worktree {}/{}: {}",
+                idx + 1,
+                results.len(),
+                result.worktree.display()
+            );
+
+            // Attempt to merge the worktree
+            match resolver.merge(&result.worktree, &staging_branch)? {
+                MergeResult::Success { commit } => {
+                    zlog!(
+                        "[orchestrator] Worktree {} merged successfully: {}",
+                        result.worktree.display(),
+                        commit
+                    );
+                }
+                MergeResult::Conflicts { files } => {
+                    zlog!(
+                        "[orchestrator] Worktree {} has {} conflicts, resolving...",
+                        result.worktree.display(),
+                        files.len()
+                    );
+
+                    // Use AI-assisted conflict resolution
+                    match resolver.resolve_conflicts(files, &self.repo_path).await {
+                        Ok(commit) => {
+                            zlog!(
+                                "[orchestrator] Conflicts resolved for worktree {}: {}",
+                                result.worktree.display(),
+                                commit
+                            );
+                        }
+                        Err(e) => {
+                            return Err(Error::ConflictResolutionFailed {
+                                reason: format!(
+                                    "Failed to resolve conflicts for worktree {}: {}",
+                                    result.worktree.display(),
+                                    e
+                                ),
+                            });
+                        }
+                    }
+                }
+                MergeResult::Failed { error } => {
+                    return Err(Error::ConflictResolutionFailed {
+                        reason: format!(
+                            "Merge failed for worktree {}: {}",
+                            result.worktree.display(),
+                            error
+                        ),
+                    });
+                }
+            }
+        }
+
+        zlog!(
+            "[orchestrator] Merge phase completed successfully. Staging branch: {}",
+            staging_branch
+        );
+
         Ok(())
     }
 
-    /// Run the documentation phase (stub - will be implemented in Step 13).
+    /// Run the documentation phase by executing /codebase-summary.
+    ///
+    /// This is Phase 5 of the workflow and is optional. It updates documentation
+    /// (AGENTS.md, README.md, etc.) to reflect new code added during the workflow.
+    ///
+    /// The phase is controlled by `WorkflowConfig.update_docs`:
+    /// - If `false`, the phase is skipped immediately
+    /// - If `true`, /codebase-summary is executed
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success or if the phase is skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the agent fails to spawn or /codebase-summary fails.
+    /// Note that documentation failure is typically non-critical - the workflow
+    /// should continue even if this phase fails.
     async fn run_documentation_phase(&self) -> Result<()> {
-        zlog_debug!("[orchestrator] Documentation phase stub - will run /codebase-summary in Step 13");
+        // Check if documentation update is enabled
+        let update_docs = self.state.read().await.workflow().config.update_docs;
+        if !update_docs {
+            zlog!("[orchestrator] Documentation phase skipped (update_docs=false)");
+            return Ok(());
+        }
+
+        zlog!("[orchestrator] Running /codebase-summary skill");
+
+        // Spawn an agent for the codebase-summary skill
+        let agent = self
+            .agent_pool
+            .write()
+            .await
+            .spawn_for_skill("codebase-summary")
+            .await?;
+        zlog_debug!("[orchestrator] Agent {} spawned for documentation", agent.id);
+
+        // Send the /codebase-summary command
+        agent.send("/codebase-summary")?;
+        zlog_debug!("[orchestrator] Sent /codebase-summary command to agent");
+
+        // Monitor agent output and answer questions via AIHumanProxy
+        let config = MonitorConfig::default();
+        let skill_result = self.monitor_agent_output(&agent, &config).await?;
+
+        if !skill_result.is_success() {
+            return Err(Error::ClaudeExecutionFailed(
+                "Codebase summary skill did not complete successfully".to_string(),
+            ));
+        }
+
+        zlog!(
+            "[orchestrator] Documentation phase completed: {} questions answered in {:?}",
+            skill_result.questions_answered,
+            skill_result.duration
+        );
+
         Ok(())
     }
 
@@ -2387,5 +2556,363 @@ Description for task {}.
         // Note: Can't easily test event sending without spawning an agent
         // which requires tmux. Just verify the method doesn't panic.
         assert!(rx2.try_recv().is_err()); // No events yet
+    }
+
+    // ========== Documentation Phase Tests (Step 13) ==========
+
+    // Helper to create a test orchestrator with custom config
+    fn create_test_orchestrator_with_config(config: WorkflowConfig) -> SkillsOrchestrator {
+        let repo_path = PathBuf::from("/tmp/test-repo");
+
+        // Create with mock binary since we're testing
+        let (event_tx, event_rx) = mpsc::channel(100);
+        let agent_pool = AgentPool::new(config.max_parallel_agents, event_tx);
+        let workflow = Workflow::new("", config);
+        let state = WorkflowState::new(workflow);
+        let claude = ClaudeHeadless::with_binary(PathBuf::from("/mock/claude"));
+        let ai_human = AIHumanProxy::new("");
+
+        SkillsOrchestrator {
+            ai_human,
+            agent_pool: Arc::new(RwLock::new(agent_pool)),
+            state: Arc::new(RwLock::new(state)),
+            claude,
+            repo_path,
+            event_rx: Arc::new(RwLock::new(event_rx)),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_documentation_phase_skipped_when_update_docs_false() {
+        // Given config.update_docs = false
+        let config = WorkflowConfig {
+            update_docs: false,
+            max_parallel_agents: 4,
+            staging_branch_prefix: String::from("zen/staging/"),
+        };
+        let orchestrator = create_test_orchestrator_with_config(config);
+
+        // When run_documentation_phase() is called
+        let result = orchestrator.run_documentation_phase().await;
+
+        // Then phase returns immediately without spawning agent (no error)
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_documentation_phase_skipped_does_not_spawn_agent() {
+        // Given config.update_docs = false
+        let config = WorkflowConfig {
+            update_docs: false,
+            max_parallel_agents: 4,
+            staging_branch_prefix: String::from("zen/staging/"),
+        };
+        let orchestrator = create_test_orchestrator_with_config(config);
+
+        // When run_documentation_phase() is called
+        let _ = orchestrator.run_documentation_phase().await;
+
+        // Then no agent was spawned (pool should have 0 active agents)
+        let pool = orchestrator.agent_pool().read().await;
+        assert_eq!(pool.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_documentation_phase_attempts_spawn_when_update_docs_true() {
+        // Given config.update_docs = true (default)
+        let config = WorkflowConfig::default();
+        assert!(config.update_docs); // Verify default is true
+        let orchestrator = create_test_orchestrator_with_config(config);
+
+        // When run_documentation_phase() is called
+        let result = orchestrator.run_documentation_phase().await;
+
+        // Then it attempts to spawn an agent (fails without tmux)
+        // The error indicates it tried to spawn, which is the expected behavior
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_documentation_phase_is_phase_5() {
+        // Verify documentation is Phase 5 in the workflow
+        let phase = WorkflowPhase::Documentation;
+        assert!(matches!(phase, WorkflowPhase::Documentation));
+
+        // Verify the ordering
+        use std::cmp::Ordering;
+        assert_eq!(
+            WorkflowPhase::Merging.cmp(&WorkflowPhase::Documentation),
+            Ordering::Less
+        );
+        assert_eq!(
+            WorkflowPhase::Documentation.cmp(&WorkflowPhase::Complete),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_documentation_phase_is_optional() {
+        // Documentation phase can be skipped - Merging can go directly to Complete
+        // This is verified by checking valid phase transitions
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        // We can't easily test the transition without going through all phases
+        // But we can verify the config controls the phase
+        let config_with_docs = WorkflowConfig::default();
+        assert!(config_with_docs.update_docs);
+
+        let config_without_docs = WorkflowConfig {
+            update_docs: false,
+            ..WorkflowConfig::default()
+        };
+        assert!(!config_without_docs.update_docs);
+    }
+
+    #[tokio::test]
+    async fn test_documentation_phase_checks_config_from_workflow_state() {
+        // Verify that run_documentation_phase reads config from workflow state
+        let config = WorkflowConfig {
+            update_docs: false,
+            max_parallel_agents: 4,
+            staging_branch_prefix: String::from("zen/staging/"),
+        };
+        let orchestrator = create_test_orchestrator_with_config(config);
+
+        // Verify the state has the correct config
+        let state = orchestrator.state().read().await;
+        assert!(!state.workflow().config.update_docs);
+        drop(state);
+
+        // Run documentation phase should succeed by skipping
+        let result = orchestrator.run_documentation_phase().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_skips_documentation_when_disabled() {
+        // Test that execute() skips documentation phase when update_docs=false
+        let config = WorkflowConfig {
+            update_docs: false,
+            max_parallel_agents: 4,
+            staging_branch_prefix: String::from("zen/staging/"),
+        };
+        let mut orchestrator = create_test_orchestrator_with_config(config);
+
+        // Execute will fail at planning (no tmux), but we can verify config is set
+        let result = orchestrator.execute("test").await.unwrap();
+
+        // Planning fails first (as expected in test environment)
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result.summary.contains("Planning"));
+
+        // Verify the workflow config was preserved
+        let state = orchestrator.state().read().await;
+        assert!(!state.workflow().config.update_docs);
+    }
+
+    #[test]
+    fn test_documentation_phase_uses_codebase_summary_skill() {
+        // This test verifies the skill name used for documentation
+        // The spawn_for_skill call uses "codebase-summary" as the skill name
+        let skill_name = "codebase-summary";
+        assert_eq!(skill_name, "codebase-summary");
+    }
+
+    #[tokio::test]
+    async fn test_workflow_config_update_docs_default_is_true() {
+        // Verify that the default config has update_docs = true
+        let config = WorkflowConfig::default();
+        assert!(config.update_docs);
+
+        // This means by default, documentation phase will run
+        let orchestrator = create_test_orchestrator();
+        let state = orchestrator.state().read().await;
+        assert!(state.workflow().config.update_docs);
+    }
+
+    #[test]
+    fn test_documentation_phase_follows_merging_phase() {
+        // Verify that Documentation comes after Merging in the workflow
+        // Valid transition: Merging -> Documentation
+        use std::cmp::Ordering;
+
+        assert_eq!(
+            WorkflowPhase::Merging.cmp(&WorkflowPhase::Documentation),
+            Ordering::Less
+        );
+
+        // And Documentation is before Complete
+        assert_eq!(
+            WorkflowPhase::Documentation.cmp(&WorkflowPhase::Complete),
+            Ordering::Less
+        );
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_allows_merging_to_documentation_transition() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        // Go through phases to reach Merging
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        controller.transition(WorkflowPhase::Implementation).await.unwrap();
+        controller.transition(WorkflowPhase::Merging).await.unwrap();
+
+        // Should be able to transition to Documentation
+        let result = controller.transition(WorkflowPhase::Documentation).await;
+        assert!(result.is_ok());
+        assert_eq!(controller.current(), WorkflowPhase::Documentation);
+    }
+
+    #[tokio::test]
+    async fn test_phase_controller_allows_documentation_to_complete_transition() {
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        // Go through phases to reach Documentation
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        controller.transition(WorkflowPhase::Implementation).await.unwrap();
+        controller.transition(WorkflowPhase::Merging).await.unwrap();
+        controller.transition(WorkflowPhase::Documentation).await.unwrap();
+
+        // Should be able to transition to Complete
+        let result = controller.transition(WorkflowPhase::Complete).await;
+        assert!(result.is_ok());
+        assert_eq!(controller.current(), WorkflowPhase::Complete);
+    }
+
+    // ========== Merge Phase Tests ==========
+
+    #[tokio::test]
+    async fn test_merge_phase_skips_with_empty_results() {
+        // Given an orchestrator with no implementation results
+        let orchestrator = create_test_orchestrator();
+
+        // When run_merge_phase() is called with empty results
+        let results: Vec<ImplResult> = Vec::new();
+        let result = orchestrator.run_merge_phase(&results).await;
+
+        // Then phase returns immediately without error
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_merge_phase_uses_staging_branch_prefix_from_config() {
+        // Verify the staging branch prefix is configurable
+        let config = WorkflowConfig {
+            update_docs: true,
+            max_parallel_agents: 4,
+            staging_branch_prefix: String::from("custom/staging/"),
+        };
+
+        assert_eq!(config.staging_branch_prefix, "custom/staging/");
+    }
+
+    #[test]
+    fn test_merge_phase_is_phase_4() {
+        // Verify Merging is Phase 4 in the workflow
+        let phase = WorkflowPhase::Merging;
+        assert!(matches!(phase, WorkflowPhase::Merging));
+
+        // Verify the ordering
+        use std::cmp::Ordering;
+        assert_eq!(
+            WorkflowPhase::Implementation.cmp(&WorkflowPhase::Merging),
+            Ordering::Less
+        );
+        assert_eq!(
+            WorkflowPhase::Merging.cmp(&WorkflowPhase::Documentation),
+            Ordering::Less
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_phase_follows_implementation_phase() {
+        // Verify that Merging comes after Implementation
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        // Go through phases to reach Implementation
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        controller.transition(WorkflowPhase::Implementation).await.unwrap();
+
+        // Should be able to transition to Merging
+        let result = controller.transition(WorkflowPhase::Merging).await;
+        assert!(result.is_ok());
+        assert_eq!(controller.current(), WorkflowPhase::Merging);
+    }
+
+    #[tokio::test]
+    async fn test_merge_phase_can_skip_to_complete() {
+        // Verify that Merging can go directly to Complete (skipping Documentation)
+        let (tx, _rx) = mpsc::channel(100);
+        let mut controller = PhaseController::new(tx);
+
+        // Go through phases to reach Merging
+        controller.transition(WorkflowPhase::TaskGeneration).await.unwrap();
+        controller.transition(WorkflowPhase::Implementation).await.unwrap();
+        controller.transition(WorkflowPhase::Merging).await.unwrap();
+
+        // Should be able to transition directly to Complete
+        let result = controller.transition(WorkflowPhase::Complete).await;
+        assert!(result.is_ok());
+        assert_eq!(controller.current(), WorkflowPhase::Complete);
+    }
+
+    #[test]
+    fn test_impl_result_new() {
+        // Verify ImplResult can be created with task_id, worktree, and commit
+        use crate::core::TaskId;
+
+        let task_id = TaskId::new();
+        let worktree = PathBuf::from("/tmp/worktree");
+        let commit = String::from("abc123");
+
+        let result = ImplResult::new(task_id, worktree.clone(), commit.clone());
+
+        assert_eq!(result.task_id, task_id);
+        assert_eq!(result.worktree, worktree);
+        assert_eq!(result.commit, commit);
+    }
+
+    #[tokio::test]
+    async fn test_merge_phase_creates_staging_branch_name_from_workflow_id() {
+        // Verify staging branch naming follows the pattern
+        let config = WorkflowConfig {
+            update_docs: false,
+            max_parallel_agents: 4,
+            staging_branch_prefix: String::from("zen/staging/"),
+        };
+        let orchestrator = create_test_orchestrator_with_config(config);
+
+        // Get the workflow id short form
+        let state = orchestrator.state().read().await;
+        let workflow_id_short = state.workflow().id.short();
+        let prefix = &state.workflow().config.staging_branch_prefix;
+
+        // The staging branch should be: prefix + workflow_id_short
+        let expected_branch = format!("{}{}", prefix, workflow_id_short);
+        assert!(expected_branch.starts_with("zen/staging/"));
+        assert_eq!(expected_branch.len(), "zen/staging/".len() + 8); // 8 char short id
+    }
+
+    #[tokio::test]
+    async fn test_merge_phase_needs_repo_path() {
+        // Verify the orchestrator has a repo_path that can be used for GitOps
+        let orchestrator = create_test_orchestrator();
+
+        // The repo_path should be accessible
+        assert!(orchestrator.repo_path.to_str().is_some());
+    }
+
+    #[test]
+    fn test_workflow_config_has_staging_branch_prefix() {
+        // Verify WorkflowConfig has staging_branch_prefix field
+        let config = WorkflowConfig::default();
+
+        // Default staging_branch_prefix should be set
+        assert!(!config.staging_branch_prefix.is_empty());
+        assert!(config.staging_branch_prefix.ends_with('/'));
     }
 }

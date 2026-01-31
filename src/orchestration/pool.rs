@@ -591,6 +591,22 @@ impl AgentPool {
     pub fn set_event_sender(&mut self, event_tx: mpsc::Sender<AgentEvent>) {
         self.event_tx = event_tx;
     }
+
+    /// Iterate over all agents in the pool.
+    ///
+    /// Returns an iterator over (AgentId, AgentHandle) pairs for all
+    /// active agents in the pool.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// for (id, handle) in pool.agents_iter() {
+    ///     println!("Agent {}: {:?}", id, handle.status);
+    /// }
+    /// ```
+    pub fn agents_iter(&self) -> impl Iterator<Item = (&AgentId, &AgentHandle)> {
+        self.agents.iter()
+    }
 }
 
 #[cfg(test)]

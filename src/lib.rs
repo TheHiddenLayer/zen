@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod cleanup;
 pub mod config;
 pub mod core;
 pub mod error;
@@ -160,6 +161,10 @@ mod architecture_tests {
             show_keymap: false,
             trust_enabled: false,
             workflow: None,
+            agents: vec![],
+            selected_agent: 0,
+            dag: None,
+            show_dag: false,
         };
 
         let start = Instant::now();

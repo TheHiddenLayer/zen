@@ -67,6 +67,9 @@ pub enum Error {
 
     #[error("No code tasks found after task generation in {path}")]
     NoCodeTasksGenerated { path: String },
+
+    #[error("Conflict resolution failed: {reason}")]
+    ConflictResolutionFailed { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

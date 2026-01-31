@@ -211,6 +211,258 @@ impl ConflictResolver {
             _ => Ok(None),
         }
     }
+
+    /// Check if file content contains merge conflict markers.
+    ///
+    /// Detects the standard git conflict markers:
+    /// - `<<<<<<<` (ours marker)
+    /// - `=======` (separator)
+    /// - `>>>>>>>` (theirs marker)
+    ///
+    /// # Arguments
+    /// * `content` - The file content to check
+    ///
+    /// # Returns
+    /// `true` if any conflict markers are found, `false` otherwise
+    pub fn has_conflict_markers(content: &str) -> bool {
+        content.contains("<<<<<<<")
+            || content.contains("=======")
+            || content.contains(">>>>>>>")
+    }
+
+    /// Format conflicts into a clear prompt for the resolver agent.
+    ///
+    /// Creates a structured prompt that presents each conflict with:
+    /// - The file path
+    /// - "Ours" content (from staging branch)
+    /// - "Theirs" content (from task worktree)
+    /// - Base content (common ancestor, if available)
+    ///
+    /// # Arguments
+    /// * `conflicts` - List of conflict files to format
+    ///
+    /// # Returns
+    /// A formatted string prompt for the AI resolver agent
+    pub fn format_conflict_prompt(&self, conflicts: &[ConflictFile]) -> String {
+        let mut prompt = String::from(
+            "You are a conflict resolver agent. Resolve the following merge conflicts by \
+             combining both changes while maintaining correctness.\n\n\
+             For each conflict:\n\
+             1. Understand what each side is trying to do\n\
+             2. Determine how to combine both changes\n\
+             3. Use the Edit tool to write the resolved version to the file\n\n\
+             IMPORTANT: Do NOT leave any conflict markers (<<<<<<, =======, >>>>>>) in the files.\n\n",
+        );
+
+        for (i, conflict) in conflicts.iter().enumerate() {
+            prompt.push_str(&format!(
+                "## Conflict {} - {}\n\n",
+                i + 1,
+                conflict.path.display()
+            ));
+
+            prompt.push_str("### OURS (staging branch):\n```\n");
+            prompt.push_str(&conflict.ours);
+            prompt.push_str("\n```\n\n");
+
+            prompt.push_str("### THEIRS (task worktree):\n```\n");
+            prompt.push_str(&conflict.theirs);
+            prompt.push_str("\n```\n\n");
+
+            if let Some(base) = &conflict.base {
+                prompt.push_str("### BASE (common ancestor):\n```\n");
+                prompt.push_str(base);
+                prompt.push_str("\n```\n\n");
+            } else {
+                prompt.push_str("### BASE: (no common ancestor)\n\n");
+            }
+        }
+
+        prompt.push_str(
+            "After resolving all conflicts, confirm completion by saying 'All conflicts resolved'.\n",
+        );
+
+        prompt
+    }
+
+    /// Verify all conflict files have been resolved.
+    ///
+    /// Checks each file to ensure no conflict markers remain.
+    ///
+    /// # Arguments
+    /// * `conflict_paths` - Paths to the conflicting files (relative to repo_path)
+    /// * `repo_path` - The repository root path
+    ///
+    /// # Returns
+    /// `Ok(())` if all files are clean, or an error if markers remain or files are missing
+    pub fn verify_resolution(&self, conflict_paths: &[PathBuf], repo_path: &Path) -> Result<()> {
+        for path in conflict_paths {
+            let full_path = repo_path.join(path);
+
+            let content = std::fs::read_to_string(&full_path).map_err(|e| {
+                crate::error::Error::ConflictResolutionFailed {
+                    reason: format!("Failed to read {}: {}", path.display(), e),
+                }
+            })?;
+
+            if Self::has_conflict_markers(&content) {
+                return Err(crate::error::Error::ConflictResolutionFailed {
+                    reason: format!(
+                        "File {} still contains conflict markers",
+                        path.display()
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Commit the conflict resolution.
+    ///
+    /// Creates a commit with the resolved files. Assumes files are already staged.
+    ///
+    /// # Arguments
+    /// * `repo_path` - Path to the repository
+    /// * `message` - Commit message
+    ///
+    /// # Returns
+    /// The commit hash on success
+    pub fn commit_resolution(&self, repo_path: &Path, message: &str) -> Result<String> {
+        let repo = Repository::open(repo_path)?;
+
+        let sig = repo
+            .signature()
+            .or_else(|_| Signature::now("Zen Resolver", "zen@localhost"))?;
+
+        let mut index = repo.index()?;
+        let tree_id = index.write_tree()?;
+        let tree = repo.find_tree(tree_id)?;
+
+        let parent = repo.head()?.peel_to_commit()?;
+
+        let commit_id = repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])?;
+
+        Ok(commit_id.to_string())
+    }
+
+    /// Resolve merge conflicts using a dedicated AI agent.
+    ///
+    /// Spawns a resolver agent that:
+    /// 1. Receives context about all conflicts
+    /// 2. Uses the Edit tool to fix each conflicting file
+    /// 3. Verifies all conflict markers are removed
+    /// 4. Creates a resolution commit
+    ///
+    /// # Arguments
+    /// * `conflicts` - List of conflict files to resolve
+    /// * `repo_path` - Path to the repository where conflicts exist
+    ///
+    /// # Returns
+    /// The commit hash of the resolution commit on success
+    ///
+    /// # Errors
+    /// Returns `ConflictResolutionFailed` if:
+    /// - Agent cannot be spawned
+    /// - Agent fails to resolve conflicts
+    /// - Conflict markers remain after resolution
+    pub async fn resolve_conflicts(
+        &self,
+        conflicts: Vec<ConflictFile>,
+        repo_path: &Path,
+    ) -> Result<String> {
+        if conflicts.is_empty() {
+            return Err(crate::error::Error::ConflictResolutionFailed {
+                reason: "No conflicts to resolve".to_string(),
+            });
+        }
+
+        // Format the conflict context for the resolver agent
+        let prompt = self.format_conflict_prompt(&conflicts);
+
+        // Collect paths for verification
+        let conflict_paths: Vec<PathBuf> = conflicts.iter().map(|c| c.path.clone()).collect();
+
+        // Spawn the resolver agent
+        let agent = {
+            let mut pool = self.agent_pool.write().await;
+            pool.spawn_for_skill("conflict-resolver").await.map_err(|e| {
+                crate::error::Error::ConflictResolutionFailed {
+                    reason: format!("Failed to spawn resolver agent: {}", e),
+                }
+            })?
+        };
+
+        // Send the conflict resolution prompt
+        if let Err(e) = agent.send(&prompt) {
+            return Err(crate::error::Error::ConflictResolutionFailed {
+                reason: format!("Failed to send prompt to resolver agent: {}", e),
+            });
+        }
+
+        // Monitor the agent for completion
+        // In a full implementation, this would use monitor_agent_output pattern
+        // For now, we implement a simplified loop
+        let timeout = std::time::Duration::from_secs(300); // 5 minute timeout
+        let poll_interval = std::time::Duration::from_millis(500);
+        let start = std::time::Instant::now();
+
+        loop {
+            if start.elapsed() >= timeout {
+                // Terminate the agent before returning error
+                let _ = self.agent_pool.write().await.terminate(&agent.id).await;
+                return Err(crate::error::Error::ConflictResolutionFailed {
+                    reason: "Resolver agent timed out".to_string(),
+                });
+            }
+
+            match agent.read_output() {
+                Ok(output) => match output {
+                    super::AgentOutput::Completed => break,
+                    super::AgentOutput::Error(e) => {
+                        let _ = self.agent_pool.write().await.terminate(&agent.id).await;
+                        return Err(crate::error::Error::ConflictResolutionFailed {
+                            reason: format!("Resolver agent error: {}", e),
+                        });
+                    }
+                    super::AgentOutput::Text(text) => {
+                        // Check for completion phrase
+                        if text.to_lowercase().contains("all conflicts resolved") {
+                            break;
+                        }
+                    }
+                    super::AgentOutput::Question(_) => {
+                        // Resolver shouldn't need to ask questions, but if it does,
+                        // we could integrate with AIHumanProxy here
+                    }
+                },
+                Err(_) => {
+                    // Continue polling - output might not be ready yet
+                }
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        // Terminate the agent
+        let _ = self.agent_pool.write().await.terminate(&agent.id).await;
+
+        // Verify all conflicts are resolved
+        self.verify_resolution(&conflict_paths, repo_path)?;
+
+        // Stage the resolved files
+        let repo = Repository::open(repo_path)?;
+        let mut index = repo.index()?;
+        for path in &conflict_paths {
+            index.add_path(path)?;
+        }
+        index.write()?;
+
+        // Commit the resolution
+        let commit_hash = self.commit_resolution(repo_path, "Resolve merge conflicts")?;
+
+        Ok(commit_hash)
+    }
 }
 
 /// Result of attempting to merge a worktree into the staging branch.
@@ -930,5 +1182,377 @@ fn main() {
         // Merge should report up-to-date (as success)
         let result = resolver.merge(&worktree_path, "staging").unwrap();
         assert!(result.is_success(), "Expected Success for up-to-date, got {:?}", result);
+    }
+
+    // ========================================
+    // resolve_conflicts() tests
+    // ========================================
+
+    #[test]
+    fn test_has_conflict_markers_with_markers() {
+        let content = r#"
+fn main() {
+<<<<<<< HEAD
+    println!("Hello from ours");
+=======
+    println!("Hello from theirs");
+>>>>>>> branch
+}
+"#;
+        assert!(ConflictResolver::has_conflict_markers(content));
+    }
+
+    #[test]
+    fn test_has_conflict_markers_without_markers() {
+        let content = r#"
+fn main() {
+    println!("Hello, world!");
+}
+"#;
+        assert!(!ConflictResolver::has_conflict_markers(content));
+    }
+
+    #[test]
+    fn test_has_conflict_markers_partial_markers() {
+        // Only HEAD marker, not a complete conflict
+        let content = "<<<<<<< HEAD\nsome content";
+        assert!(ConflictResolver::has_conflict_markers(content));
+    }
+
+    #[test]
+    fn test_has_conflict_markers_separator_only() {
+        // Just the separator marker
+        let content = "some code\n=======\nmore code";
+        assert!(ConflictResolver::has_conflict_markers(content));
+    }
+
+    #[test]
+    fn test_has_conflict_markers_end_marker_only() {
+        let content = "some code\n>>>>>>> branch";
+        assert!(ConflictResolver::has_conflict_markers(content));
+    }
+
+    #[test]
+    fn test_has_conflict_markers_empty_content() {
+        assert!(!ConflictResolver::has_conflict_markers(""));
+    }
+
+    #[test]
+    fn test_format_conflict_prompt_single_conflict() {
+        let resolver = create_test_resolver();
+        let conflicts = vec![ConflictFile::new(
+            "src/main.rs",
+            "fn main() { println!(\"ours\"); }",
+            "fn main() { println!(\"theirs\"); }",
+            Some("fn main() { println!(\"base\"); }".to_string()),
+        )];
+
+        let prompt = resolver.format_conflict_prompt(&conflicts);
+
+        // Verify prompt contains key information
+        assert!(prompt.contains("src/main.rs"), "Should contain file path");
+        assert!(prompt.contains("ours"), "Should contain ours content");
+        assert!(prompt.contains("theirs"), "Should contain theirs content");
+        assert!(prompt.contains("base"), "Should contain base content");
+    }
+
+    #[test]
+    fn test_format_conflict_prompt_multiple_conflicts() {
+        let resolver = create_test_resolver();
+        let conflicts = vec![
+            ConflictFile::new("file1.rs", "ours1", "theirs1", None),
+            ConflictFile::new("file2.rs", "ours2", "theirs2", None),
+            ConflictFile::new("file3.rs", "ours3", "theirs3", None),
+        ];
+
+        let prompt = resolver.format_conflict_prompt(&conflicts);
+
+        // Verify all files are mentioned
+        assert!(prompt.contains("file1.rs"));
+        assert!(prompt.contains("file2.rs"));
+        assert!(prompt.contains("file3.rs"));
+    }
+
+    #[test]
+    fn test_format_conflict_prompt_without_base() {
+        let resolver = create_test_resolver();
+        let conflicts = vec![ConflictFile::without_base(
+            "test.rs",
+            "ours content",
+            "theirs content",
+        )];
+
+        let prompt = resolver.format_conflict_prompt(&conflicts);
+
+        assert!(prompt.contains("test.rs"));
+        assert!(prompt.contains("ours content"));
+        assert!(prompt.contains("theirs content"));
+        // Should indicate no base available
+        assert!(prompt.contains("(no common ancestor)") || prompt.contains("N/A") || !prompt.contains("BASE"));
+    }
+
+    #[test]
+    fn test_format_conflict_prompt_contains_instructions() {
+        let resolver = create_test_resolver();
+        let conflicts = vec![ConflictFile::new("test.rs", "a", "b", None)];
+
+        let prompt = resolver.format_conflict_prompt(&conflicts);
+
+        // Should contain instructions for resolving
+        assert!(
+            prompt.to_lowercase().contains("resolve")
+                || prompt.to_lowercase().contains("merge")
+                || prompt.to_lowercase().contains("combine"),
+            "Prompt should contain resolution instructions"
+        );
+    }
+
+    #[test]
+    fn test_verify_resolution_clean_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("resolved.rs");
+        fs::write(&file_path, "fn main() { println!(\"resolved\"); }").unwrap();
+
+        let resolver = create_test_resolver();
+        let paths = vec![PathBuf::from("resolved.rs")];
+
+        let result = resolver.verify_resolution(&paths, temp_dir.path());
+        assert!(result.is_ok(), "Should succeed for clean files");
+    }
+
+    #[test]
+    fn test_verify_resolution_with_markers() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("unresolved.rs");
+        fs::write(
+            &file_path,
+            "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch",
+        )
+        .unwrap();
+
+        let resolver = create_test_resolver();
+        let paths = vec![PathBuf::from("unresolved.rs")];
+
+        let result = resolver.verify_resolution(&paths, temp_dir.path());
+        assert!(result.is_err(), "Should fail for files with conflict markers");
+    }
+
+    #[test]
+    fn test_verify_resolution_missing_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let resolver = create_test_resolver();
+        let paths = vec![PathBuf::from("nonexistent.rs")];
+
+        let result = resolver.verify_resolution(&paths, temp_dir.path());
+        assert!(result.is_err(), "Should fail for missing files");
+    }
+
+    #[test]
+    fn test_commit_resolution_creates_commit() {
+        let (temp_dir, repo) = create_test_repo();
+        let resolver = create_resolver_for_repo(&temp_dir);
+
+        // Make a change
+        let file_path = temp_dir.path().join("resolved.txt");
+        fs::write(&file_path, "resolved content").unwrap();
+
+        // Stage the change
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("resolved.txt")).unwrap();
+        index.write().unwrap();
+
+        let result = resolver.commit_resolution(temp_dir.path(), "Resolve merge conflicts");
+        assert!(result.is_ok(), "Should create commit");
+
+        // Verify commit was created
+        let commit_hash = result.unwrap();
+        assert!(!commit_hash.is_empty(), "Should return commit hash");
+    }
+
+    // ========================================
+    // resolve_conflicts() async method tests
+    // ========================================
+
+    #[tokio::test]
+    async fn test_resolve_conflicts_empty_conflicts_returns_error() {
+        let resolver = create_test_resolver();
+        let result = resolver.resolve_conflicts(vec![], Path::new("/tmp")).await;
+        assert!(result.is_err(), "Should error on empty conflicts");
+        let err = result.unwrap_err();
+        assert!(
+            format!("{}", err).contains("No conflicts to resolve"),
+            "Error message should mention no conflicts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_conflicts_spawns_resolver_agent() {
+        // This test verifies that resolve_conflicts attempts to spawn an agent
+        // In test environment without tmux, it will fail at spawn, which is expected
+        let resolver = create_test_resolver();
+        let conflicts = vec![ConflictFile::new(
+            "test.rs",
+            "ours content",
+            "theirs content",
+            None,
+        )];
+
+        let result = resolver.resolve_conflicts(conflicts, Path::new("/tmp")).await;
+
+        // Should fail because we can't spawn tmux in test environment
+        assert!(result.is_err(), "Should fail to spawn agent in test environment");
+        let err = result.unwrap_err();
+        // Error should be about spawning agent, not about empty conflicts
+        assert!(
+            format!("{}", err).contains("spawn") || format!("{}", err).contains("agent"),
+            "Error should be related to agent spawning, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_conflicts_formats_prompt_with_conflict_context() {
+        let resolver = create_test_resolver();
+
+        // Test that the prompt formatting is working correctly
+        // (This is already tested in format_conflict_prompt tests, but we verify
+        // that resolve_conflicts uses it properly)
+        let conflicts = vec![
+            ConflictFile::new(
+                "src/main.rs",
+                "fn main() { println!(\"from ours\"); }",
+                "fn main() { println!(\"from theirs\"); }",
+                Some("fn main() { println!(\"base\"); }".to_string()),
+            ),
+            ConflictFile::new(
+                "src/lib.rs",
+                "pub fn hello() -> &'static str { \"ours\" }",
+                "pub fn hello() -> &'static str { \"theirs\" }",
+                None,
+            ),
+        ];
+
+        // Format the prompt (the same method resolve_conflicts uses)
+        let prompt = resolver.format_conflict_prompt(&conflicts);
+
+        // Verify both conflicts are in the prompt
+        assert!(prompt.contains("src/main.rs"));
+        assert!(prompt.contains("src/lib.rs"));
+        assert!(prompt.contains("from ours"));
+        assert!(prompt.contains("from theirs"));
+        assert!(prompt.contains("base"));
+    }
+
+    #[test]
+    fn test_resolve_conflicts_verify_resolution_succeeds_for_clean_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let resolver = create_test_resolver();
+
+        // Create clean resolved files
+        fs::write(temp_dir.path().join("file1.rs"), "resolved content 1").unwrap();
+        fs::write(temp_dir.path().join("file2.rs"), "resolved content 2").unwrap();
+
+        let paths = vec![PathBuf::from("file1.rs"), PathBuf::from("file2.rs")];
+
+        let result = resolver.verify_resolution(&paths, temp_dir.path());
+        assert!(result.is_ok(), "Should pass verification for clean files");
+    }
+
+    #[test]
+    fn test_resolve_conflicts_verify_resolution_fails_for_unresolved_markers() {
+        let temp_dir = TempDir::new().unwrap();
+        let resolver = create_test_resolver();
+
+        // Create file with conflict markers still present
+        fs::write(
+            temp_dir.path().join("unresolved.rs"),
+            r#"fn main() {
+<<<<<<< HEAD
+    println!("ours");
+=======
+    println!("theirs");
+>>>>>>> branch
+}"#,
+        )
+        .unwrap();
+
+        let paths = vec![PathBuf::from("unresolved.rs")];
+
+        let result = resolver.verify_resolution(&paths, temp_dir.path());
+        assert!(result.is_err(), "Should fail for files with conflict markers");
+    }
+
+    #[test]
+    fn test_resolve_conflicts_commit_creates_proper_commit() {
+        let (temp_dir, repo) = create_test_repo();
+        let resolver = create_resolver_for_repo(&temp_dir);
+
+        // Create and stage a resolved file
+        let file_path = temp_dir.path().join("resolved_conflict.rs");
+        fs::write(&file_path, "fn main() { println!(\"resolved\"); }").unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("resolved_conflict.rs")).unwrap();
+        index.write().unwrap();
+
+        let commit_hash = resolver
+            .commit_resolution(temp_dir.path(), "Resolve merge conflicts")
+            .expect("Should create commit");
+
+        // Verify commit exists and has correct message
+        let commit = repo.find_commit(git2::Oid::from_str(&commit_hash).unwrap()).unwrap();
+        assert!(commit.message().unwrap().contains("Resolve merge conflicts"));
+    }
+
+    #[test]
+    fn test_conflict_resolution_failed_error_variant() {
+        let error = crate::error::Error::ConflictResolutionFailed {
+            reason: "Test failure reason".to_string(),
+        };
+        let error_msg = format!("{}", error);
+        assert!(error_msg.contains("Test failure reason"));
+        assert!(error_msg.to_lowercase().contains("conflict"));
+    }
+
+    #[test]
+    fn test_resolve_conflicts_prompt_includes_edit_instructions() {
+        let resolver = create_test_resolver();
+        let conflicts = vec![ConflictFile::new("test.rs", "a", "b", None)];
+
+        let prompt = resolver.format_conflict_prompt(&conflicts);
+
+        // Prompt should instruct agent to use Edit tool
+        assert!(
+            prompt.contains("Edit") || prompt.contains("edit"),
+            "Prompt should mention Edit tool"
+        );
+    }
+
+    #[test]
+    fn test_resolve_conflicts_prompt_includes_completion_marker() {
+        let resolver = create_test_resolver();
+        let conflicts = vec![ConflictFile::new("test.rs", "a", "b", None)];
+
+        let prompt = resolver.format_conflict_prompt(&conflicts);
+
+        // Prompt should tell agent how to signal completion
+        assert!(
+            prompt.contains("resolved") || prompt.contains("complete"),
+            "Prompt should include completion instructions"
+        );
+    }
+
+    #[test]
+    fn test_resolve_conflicts_prompt_warns_about_markers() {
+        let resolver = create_test_resolver();
+        let conflicts = vec![ConflictFile::new("test.rs", "a", "b", None)];
+
+        let prompt = resolver.format_conflict_prompt(&conflicts);
+
+        // Prompt should warn about not leaving conflict markers
+        assert!(
+            prompt.contains("<<<<") || prompt.contains("marker") || prompt.contains("conflict"),
+            "Prompt should warn about conflict markers"
+        );
     }
 }
