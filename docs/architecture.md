@@ -1,14 +1,91 @@
 # Zen Architecture
 
-> A minimal, blazingly fast Rust TUI for managing parallel AI coding sessions.
+> A parallel AI agent orchestrator that transforms natural language prompts into implemented code through concurrent Claude Code agents.
 
 **Related docs:**
+- [Skills Integration](./skills-integration.md) - Skills workflow, AI-as-Human pattern
 - [Game Loop Architecture](./game-loop-architecture.md) - Two-thread design, state snapshotting
 - [TEA Pattern](./tea-pattern.md) - Model, Message, Command, update function
 - [Actor System](./actors.md) - Background tasks
 - [Async Patterns](./async-patterns.md) - Tokio integration
 - [UI Design](./ui-design.md) - Rendering strategy
 - [Data Model](./data-model.md) - State and persistence
+
+---
+
+## System Overview
+
+Zen orchestrates multiple Claude Code agents working in parallel across git worktrees, with AI-driven dependency inference, automatic conflict resolution, and a reactive planning system.
+
+```mermaid
+graph TB
+    subgraph "User Interface"
+        CLI[CLI Input]
+        TUI[TUI Dashboard]
+    end
+
+    subgraph "Skills Orchestration Layer"
+        SkillOrch[Skills Orchestrator]
+        AIHuman[AI-as-Human Proxy]
+        PhaseCtrl[Phase Controller]
+    end
+
+    subgraph "Orchestration Layer"
+        Scheduler[DAG Scheduler]
+        Planner[Reactive Planner]
+        Resolver[Conflict Resolver]
+        Health[Health Monitor]
+    end
+
+    subgraph "Agent Management"
+        Pool[Agent Pool]
+        Tmux[Tmux Manager]
+    end
+
+    subgraph "State Management"
+        GitState[Git State Manager]
+        GitRefs[refs/zen/*]
+        GitNotes[refs/notes/zen/*]
+    end
+
+    subgraph "Execution Layer"
+        WT1[Worktree 1]
+        WT2[Worktree 2]
+        WTN[Worktree N]
+        CC1[Claude Code]
+        CC2[Claude Code]
+        CCN[Claude Code]
+    end
+
+    CLI --> SkillOrch
+    TUI --> SkillOrch
+    SkillOrch --> PhaseCtrl
+    SkillOrch --> AIHuman
+    PhaseCtrl --> Scheduler
+    Scheduler --> Pool
+    Planner --> Scheduler
+    Health --> Pool
+    Pool --> Tmux
+    Tmux --> WT1 & WT2 & WTN
+    WT1 --> CC1
+    WT2 --> CC2
+    WTN --> CCN
+    CC1 & CC2 & CCN --> Resolver
+    Resolver --> GitState
+    GitState --> GitRefs & GitNotes
+```
+
+### Workflow Phases
+
+Zen executes workflows through five sequential phases:
+
+```
+Phase 1: Planning (/pdd)
+    └─► Phase 2: Task Generation (/code-task-generator)
+        └─► Phase 3: Implementation (/code-assist) ─ Parallel Agents
+            └─► Phase 4: Merging (Conflict Resolution)
+                └─► Phase 5: Documentation (/codebase-summary) [Optional]
+```
 
 ---
 
@@ -23,38 +100,63 @@
 
 ---
 
-## Architecture Overview
+## Thread Architecture
+
+Zen uses a two-thread architecture with orchestration extensions:
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Decoupled Game Loop Architecture                  │
-│                                                                      │
-│  ┌─────────────────────────┐       ┌──────────────────────────────┐ │
-│  │     Main Thread         │       │       Logic Thread           │ │
-│  │     (Render Loop)       │       │     (Tokio Runtime)          │ │
-│  │                         │       │                              │ │
-│  │  ┌─────────────────┐    │       │  ┌────────────────────────┐  │ │
-│  │  │    Terminal     │    │       │  │   Keyboard Polling     │  │ │
-│  │  │   (Ratatui)     │    │       │  │   (Zero Timeout)       │  │ │
-│  │  └─────────────────┘    │       │  └────────────────────────┘  │ │
-│  │          ▲              │       │            │                 │ │
-│  │          │              │       │            ▼                 │ │
-│  │  ┌─────────────────┐    │       │  ┌────────────────────────┐  │ │
-│  │  │  RenderState    │◄───┼───────┼──│   TEA Update Loop      │  │ │
-│  │  │  (Snapshot)     │    │       │  │   Model + Message =    │  │ │
-│  │  └─────────────────┘    │       │  │   Commands             │  │ │
-│  │                         │       │  └────────────────────────┘  │ │
-│  │  60 FPS Cap             │       │            │                 │ │
-│  │  On-Change Render       │       │            ▼                 │ │
-│  │                         │       │  ┌────────────────────────┐  │ │
-│  └─────────────────────────┘       │  │   Background Actors    │  │ │
-│                                    │  │   - Preview (250ms)    │  │ │
-│                                    │  │   - Diff (1000ms)      │  │ │
-│                                    │  │   - Prompt (500ms)     │  │ │
-│                                    │  └────────────────────────┘  │ │
-│                                    └──────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    Decoupled Game Loop + Orchestration                        │
+│                                                                               │
+│  ┌─────────────────────────┐       ┌────────────────────────────────────────┐│
+│  │     Main Thread         │       │           Logic Thread                  ││
+│  │     (Render Loop)       │       │         (Tokio Runtime)                 ││
+│  │                         │       │                                         ││
+│  │  ┌─────────────────┐    │       │  ┌────────────────────────┐             ││
+│  │  │    Terminal     │    │       │  │   Keyboard Polling     │             ││
+│  │  │   (Ratatui)     │    │       │  │   (Zero Timeout)       │             ││
+│  │  └─────────────────┘    │       │  └────────────────────────┘             ││
+│  │          ▲              │       │            │                            ││
+│  │          │              │       │            ▼                            ││
+│  │  ┌─────────────────┐    │       │  ┌────────────────────────┐             ││
+│  │  │  RenderState    │◄───┼───────┼──│   TEA Update Loop      │             ││
+│  │  │  (Snapshot)     │    │       │  │   Model + Message =    │             ││
+│  │  └─────────────────┘    │       │  │   Commands             │             ││
+│  │                         │       │  └────────────────────────┘             ││
+│  │  60 FPS Cap             │       │            │                            ││
+│  │  On-Change Render       │       │            ▼                            ││
+│  │                         │       │  ┌────────────────────────┐             ││
+│  └─────────────────────────┘       │  │   Background Actors    │             ││
+│                                    │  │   - Preview (250ms)    │             ││
+│                                    │  │   - Diff (1000ms)      │             ││
+│                                    │  │   - Prompt (500ms)     │             ││
+│                                    │  │   - Health (5000ms)    │             ││
+│                                    │  └────────────────────────┘             ││
+│                                    │            │                            ││
+│                                    │            ▼                            ││
+│                                    │  ┌────────────────────────┐             ││
+│                                    │  │  Skills Orchestrator   │             ││
+│                                    │  │  - Phase Controller    │             ││
+│                                    │  │  - AI-as-Human Proxy   │             ││
+│                                    │  │  - DAG Scheduler       │             ││
+│                                    │  └────────────────────────┘             ││
+│                                    │            │                            ││
+│                                    │            ▼                            ││
+│                                    │  ┌────────────────────────────────────┐ ││
+│                                    │  │        Agent Pool                  │ ││
+│                                    │  │  ┌──────┐ ┌──────┐ ┌──────┐        │ ││
+│                                    │  │  │Agent1│ │Agent2│ │AgentN│        │ ││
+│                                    │  │  │Monitor│ │Monitor│ │Monitor│       │ ││
+│                                    │  │  └──────┘ └──────┘ └──────┘        │ ││
+│                                    │  └────────────────────────────────────┘ ││
+│                                    └────────────────────────────────────────┘│
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Thread Responsibilities:**
+- **Main Thread**: 60 FPS render loop, terminal I/O (no blocking)
+- **Logic Thread**: Tokio runtime, TEA updates, command execution, orchestration
+- **Agent Monitors**: Per-agent output capture and health monitoring (spawned as needed)
 
 ---
 
@@ -63,32 +165,108 @@
 ```
 zen/
 ├── src/
-│   ├── main.rs          # Entry point, render loop (main thread)
-│   ├── app.rs           # Logic thread, event coordination
-│   ├── render.rs        # RenderState snapshots, version tracking
-│   ├── ui.rs            # All rendering code (< 500 lines)
-│   ├── tea/             # TEA pattern implementation
+│   ├── main.rs              # Entry point, CLI parsing, render loop
+│   ├── lib.rs               # Module exports
+│   ├── app.rs               # Logic thread, event coordination
+│   ├── render.rs            # RenderState snapshots, version tracking
+│   ├── ui.rs                # TUI rendering (dashboard, agent grid, DAG)
+│   ├── cleanup.rs           # Worktree and resource cleanup
+│   │
+│   ├── core/                # Core domain models
 │   │   ├── mod.rs
-│   │   ├── model.rs     # Application state
-│   │   ├── message.rs   # Input events
-│   │   ├── command.rs   # Side effects
-│   │   └── update.rs    # Pure update function
-│   ├── actors/          # Background tasks
-│   │   ├── mod.rs       # ActorHandle, SessionInfo
-│   │   ├── preview.rs   # Tmux pane capture
-│   │   ├── diff.rs      # Git diff computation
-│   │   └── prompt.rs    # Prompt detection
-│   ├── session.rs       # Session CRUD operations
-│   ├── git.rs           # Worktree and diff operations
-│   ├── tmux.rs          # Terminal multiplexer integration
-│   ├── agent.rs         # Trait-based agent abstraction
-│   ├── config.rs        # Configuration loading
-│   ├── error.rs         # Error types
-│   ├── log.rs           # Debug logging
-│   └── util.rs          # Blocking helpers with timeout
-├── Cargo.toml
-└── docs/
+│   │   ├── task.rs          # Task model with lifecycle
+│   │   ├── dag.rs           # TaskDAG with petgraph
+│   │   └── code_task.rs     # .code-task.md parser
+│   │
+│   ├── workflow/            # Workflow state management
+│   │   ├── mod.rs
+│   │   ├── types.rs         # WorkflowId, Phase, Status, Config
+│   │   └── state.rs         # WorkflowState with phase transitions
+│   │
+│   ├── orchestration/       # Orchestration layer
+│   │   ├── mod.rs
+│   │   ├── skills.rs        # SkillsOrchestrator, PhaseController
+│   │   ├── ai_human.rs      # AIHumanProxy for autonomous Q&A
+│   │   ├── pool.rs          # AgentPool, AgentHandle
+│   │   ├── scheduler.rs     # DAG-based parallel scheduler
+│   │   ├── resolver.rs      # ConflictResolver for merges
+│   │   ├── health.rs        # HealthMonitor, RecoveryAction
+│   │   ├── planner.rs       # ReactivePlanner, file watching
+│   │   ├── claude.rs        # ClaudeHeadless executor
+│   │   └── detection.rs     # Question detection patterns
+│   │
+│   ├── state/               # Git-native state persistence
+│   │   ├── mod.rs
+│   │   ├── manager.rs       # GitStateManager
+│   │   └── migration.rs     # State migration tool
+│   │
+│   ├── tea/                 # TEA pattern (The Elm Architecture)
+│   │   ├── mod.rs
+│   │   ├── model.rs         # Application state
+│   │   ├── message.rs       # Input events
+│   │   ├── command.rs       # Side effects
+│   │   └── update.rs        # Pure update function
+│   │
+│   ├── git.rs               # GitOps, GitRefs, GitNotes
+│   ├── tmux.rs              # Tmux session management
+│   ├── agent.rs             # Agent abstraction, AgentId, AgentStatus
+│   ├── session.rs           # Session CRUD operations
+│   ├── config.rs            # Configuration loading
+│   └── error.rs             # Error types
+│
+├── tests/
+│   └── integration/         # E2E, performance, parallel tests
+├── docs/                    # Architecture documentation
+└── Cargo.toml
 ```
+
+---
+
+## Component Descriptions
+
+### Skills Orchestration Layer
+
+| Component | Module | Purpose |
+|-----------|--------|---------|
+| **SkillsOrchestrator** | `orchestration/skills.rs` | Coordinates the 5-phase workflow (PDD → TaskGen → Impl → Merge → Docs) |
+| **AIHumanProxy** | `orchestration/ai_human.rs` | Autonomously answers skill clarification questions on behalf of user |
+| **PhaseController** | `orchestration/skills.rs` | Manages phase transitions with validation and event emission |
+
+### Orchestration Layer
+
+| Component | Module | Purpose |
+|-----------|--------|---------|
+| **Scheduler** | `orchestration/scheduler.rs` | DAG-based parallel task execution with dependency respect |
+| **ReactivePlanner** | `orchestration/planner.rs` | Watches plan files for changes and updates DAG dynamically |
+| **ConflictResolver** | `orchestration/resolver.rs` | AI-assisted merge conflict resolution with dedicated resolver agent |
+| **HealthMonitor** | `orchestration/health.rs` | Detects stuck agents and determines recovery actions |
+
+### Agent Management
+
+| Component | Module | Purpose |
+|-----------|--------|---------|
+| **AgentPool** | `orchestration/pool.rs` | Manages agent lifecycle (spawn, monitor, terminate) with capacity limits |
+| **AgentHandle** | `orchestration/pool.rs` | Communication interface for agents (send commands, read output) |
+| **ClaudeHeadless** | `orchestration/claude.rs` | Executes Claude Code in headless mode with JSON parsing |
+
+### State Management
+
+| Component | Module | Purpose |
+|-----------|--------|---------|
+| **GitStateManager** | `state/manager.rs` | Unified interface for git-native state persistence |
+| **GitRefs** | `git.rs` | Manages refs/zen/* for workflow/task references |
+| **GitNotes** | `git.rs` | Stores JSON metadata in refs/notes/zen/* |
+| **GitOps** | `git.rs` | Worktree CRUD, branch operations, diff computation |
+
+### Core Models
+
+| Model | Module | Purpose |
+|-------|--------|---------|
+| **Workflow** | `workflow/types.rs` | Complete workflow state with config and lifecycle |
+| **WorkflowState** | `workflow/state.rs` | Phase tracking with transition validation |
+| **Task** | `core/task.rs` | Single unit of work with status and execution context |
+| **TaskDAG** | `core/dag.rs` | Dependency graph using petgraph DiGraph |
+| **CodeTask** | `core/code_task.rs` | Parsed .code-task.md file with metadata |
 
 ---
 
@@ -418,6 +596,30 @@ Total                                 ~30ms
 | Spawn per-request | Too many tasks | Fixed actor count |
 | Unbounded processing | Starves input | Bounded drain |
 
+### Git-Native State Management
+
+All orchestration state is stored in git refs and notes for portability and versioning:
+
+```
+refs/zen/
+├── workflows/
+│   └── {workflow-id}          # Points to workflow commit
+├── tasks/
+│   └── {task-id}              # Points to task branch HEAD
+└── staging                    # Staging branch for completed work
+
+refs/notes/zen/
+├── workflows/                 # Workflow metadata (JSON)
+├── tasks/                     # Task metadata (JSON)
+└── agents/                    # Agent session metadata (JSON)
+```
+
+**Benefits:**
+- Portable - state travels with the repository
+- Versioned - full history of all state changes
+- No external dependencies - no database required
+- Git-native tooling works (reflog, gc, etc.)
+
 ---
 
 ## Dependencies
@@ -438,6 +640,15 @@ crossbeam-channel = "0.5"
 # Git
 git2 = "0.19"
 
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# DAG
+petgraph = "0.6"
+
+# File watching
+notify = "6"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -447,6 +658,9 @@ thiserror = "1"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+
+# Regex
+regex = "1"
 
 # Utilities
 dirs = "5"
@@ -482,3 +696,20 @@ which = "6"
 2. **State snapshots** - Version tracking, change detection
 3. **Channel semantics** - Latest-wins, non-blocking
 4. **Actor isolation** - Each actor testable independently
+5. **Integration tests** - E2E workflow tests, parallel agent tests
+6. **Performance tests** - 60 FPS render, scheduler overhead, memory baseline
+
+### Test Categories
+
+| Category | Scope | Location |
+|----------|-------|----------|
+| Unit Tests | Individual functions, data structures | `src/**/*.rs` (inline) |
+| Integration Tests | Component interactions, E2E workflows | `tests/integration/` |
+| Performance Tests | Timing, memory, concurrency | `tests/integration/performance.rs` |
+
+Run tests with:
+```bash
+cargo test                    # All unit tests
+cargo test --test integration # Integration tests only
+cargo test workflow           # Workflow-related tests
+```
